@@ -139,21 +139,8 @@ function callSafe(listener: GrowthBookRefreshListener): void {
 export function onGrowthBookRefresh(
   listener: GrowthBookRefreshListener,
 ): () => void {
-  let subscribed = true
-  const unsubscribe = refreshed.subscribe(() => callSafe(listener))
-  if (remoteEvalFeatureValues.size > 0) {
-    queueMicrotask(() => {
-      // Re-check: listener may have been removed, or resetGrowthBook may have
-      // cleared the Map, between registration and this microtask running.
-      if (subscribed && remoteEvalFeatureValues.size > 0) {
-        callSafe(listener)
-      }
-    })
-  }
-  return () => {
-    subscribed = false
-    unsubscribe()
-  }
+  void listener
+  return () => {}
 }
 
 /**
@@ -197,8 +184,8 @@ function getEnvOverrides(): Record<string, unknown> | null {
  * disk or network — callers can skip awaiting init for that feature.
  */
 export function hasGrowthBookEnvOverride(feature: string): boolean {
-  const overrides = getEnvOverrides()
-  return overrides !== null && feature in overrides
+  void feature
+  return false
 }
 
 /**

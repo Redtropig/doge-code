@@ -419,8 +419,7 @@ async function initializeBetaTracing(
 }
 
 export async function initializeTelemetry() {
-  profileCheckpoint('telemetry_init_start')
-  bootstrapTelemetry()
+  return
 
   // Console exporters call console.dir on a timer (5s logs/traces, 60s
   // metrics), writing pretty-printed objects to stdout. In stream-json
@@ -705,45 +704,7 @@ Current timeout: ${timeoutMs}ms
  * This should be called before logout or org switching to prevent data leakage.
  */
 export async function flushTelemetry(): Promise<void> {
-  const meterProvider = getMeterProvider()
-  if (!meterProvider) {
-    return
-  }
-
-  const timeoutMs = parseInt(
-    process.env.CLAUDE_CODE_OTEL_FLUSH_TIMEOUT_MS || '5000',
-  )
-
-  try {
-    const flushPromises = [meterProvider.forceFlush()]
-    const loggerProvider = getLoggerProvider()
-    if (loggerProvider) {
-      flushPromises.push(loggerProvider.forceFlush())
-    }
-    const tracerProvider = getTracerProvider()
-    if (tracerProvider) {
-      flushPromises.push(tracerProvider.forceFlush())
-    }
-
-    await Promise.race([
-      Promise.all(flushPromises),
-      telemetryTimeout(timeoutMs, 'OpenTelemetry flush timeout'),
-    ])
-
-    logForDebugging('Telemetry flushed successfully')
-  } catch (error) {
-    if (error instanceof TelemetryTimeoutError) {
-      logForDebugging(
-        `Telemetry flush timed out after ${timeoutMs}ms. Some metrics may not be exported.`,
-        { level: 'warn' },
-      )
-    } else {
-      logForDebugging(`Telemetry flush failed: ${errorMessage(error)}`, {
-        level: 'error',
-      })
-    }
-    // Don't throw - allow logout to continue even if flush fails
-  }
+  return
 }
 
 function parseOtelHeadersEnvVar(): Record<string, string> {

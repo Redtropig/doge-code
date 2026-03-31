@@ -93,6 +93,8 @@ let sink: AnalyticsSink | null = null
  * the default command) without coordination.
  */
 export function attachAnalyticsSink(newSink: AnalyticsSink): void {
+  void newSink
+  return
   if (sink !== null) {
     return
   }
@@ -136,11 +138,9 @@ export function logEvent(
   // to avoid accidentally logging code/filepaths
   metadata: LogEventMetadata,
 ): void {
-  if (sink === null) {
-    eventQueue.push({ eventName, metadata, async: false })
-    return
-  }
-  sink.logEvent(eventName, metadata)
+  void eventName
+  void metadata
+  return
 }
 
 /**
@@ -156,11 +156,9 @@ export async function logEventAsync(
   // intentionally no strings, to avoid accidentally logging code/filepaths
   metadata: LogEventMetadata,
 ): Promise<void> {
-  if (sink === null) {
-    eventQueue.push({ eventName, metadata, async: true })
-    return
-  }
-  await sink.logEventAsync(eventName, metadata)
+  void eventName
+  void metadata
+  return
 }
 
 /**

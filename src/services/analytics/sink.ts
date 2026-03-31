@@ -94,8 +94,7 @@ function logEventAsyncImpl(
  * Called from main.tsx during setupBackend().
  */
 export function initializeAnalyticsGates(): void {
-  isDatadogGateEnabled =
-    checkStatsigFeatureGate_CACHED_MAY_BE_STALE(DATADOG_GATE_NAME)
+  isDatadogGateEnabled = false
 }
 
 /**
@@ -108,7 +107,7 @@ export function initializeAnalyticsGates(): void {
  */
 export function initializeAnalyticsSink(): void {
   attachAnalyticsSink({
-    logEvent: logEventImpl,
-    logEventAsync: logEventAsyncImpl,
+    logEvent: () => {},
+    logEventAsync: async () => {},
   })
 }
