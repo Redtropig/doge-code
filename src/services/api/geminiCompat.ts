@@ -2,8 +2,7 @@ import type {
   BetaMessage,
   BetaMessageParam,
   BetaRawMessageStreamEvent,
-  BetaToolChoiceAuto,
-  BetaToolChoiceTool,
+  BetaToolChoice,
   BetaToolUnion,
 } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import type { EffortValue } from 'src/utils/effort.js'
@@ -56,7 +55,7 @@ type GeminiRequest = {
   tools?: GeminiTool[]
   toolConfig?: {
     functionCallingConfig: {
-      mode: 'AUTO' | 'ANY'
+      mode: 'AUTO' | 'ANY' | 'NONE'
       allowedFunctionNames?: string[]
     }
   }
@@ -82,6 +81,11 @@ type GeminiStreamChunk = {
     candidatesTokenCount?: number
     totalTokenCount?: number
   }
+  promptFeedback?: {
+    blockReason?: string
+    blockReasonMessage?: string
+  }
+  error?: { code?: number; message?: string; status?: string }
 }
 
 function getToolNameById(messages: BetaMessageParam[]): Map<string, string> {
@@ -119,7 +123,7 @@ function getGeminiToolDefinitions(tools?: BetaToolUnion[]): GeminiTool[] | undef
 }
 
 function mapToolChoice(
-  toolChoice?: BetaToolChoiceAuto | BetaToolChoiceTool,
+  toolChoice?: BetaToolChoice,
 ): GeminiRequest['toolConfig'] | undefined {
   if (toolChoice?.type === 'tool') {
     return {
@@ -131,11 +135,15 @@ function mapToolChoice(
   }
 
   if (toolChoice?.type === 'auto') {
-    return {
-      functionCallingConfig: {
-        mode: 'AUTO',
-      },
-    }
+    return { functionCallingConfig: { mode: 'AUTO' } }
+  }
+
+  if (toolChoice?.type === 'any') {
+    return { functionCallingConfig: { mode: 'ANY' } }
+  }
+
+  if (toolChoice?.type === 'none') {
+    return { functionCallingConfig: { mode: 'NONE' } }
   }
 
   return undefined
@@ -155,20 +163,29 @@ function mapAnthropicUserBlocksToGeminiParts(blocks: AnyBlock[]): GeminiPart[] {
     if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
       return [{ text: block.text }]
     }
-    if (
-      block.type === 'image' &&
-      block.source &&
-      typeof block.source === 'object' &&
-      (block.source as Record<string, unknown>).type === 'base64' &&
-      typeof (block.source as Record<string, unknown>).media_type === 'string' &&
-      typeof (block.source as Record<string, unknown>).data === 'string'
-    ) {
-      return [{
-        inlineData: {
-          mimeType: String((block.source as Record<string, unknown>).media_type),
-          data: String((block.source as Record<string, unknown>).data),
-        },
-      }]
+    if (block.type === 'image' && block.source && typeof block.source === 'object') {
+      const source = block.source as Record<string, unknown>
+      if (
+        source.type === 'base64' &&
+        typeof source.media_type === 'string' &&
+        typeof source.data === 'string'
+      ) {
+        return [{
+          inlineData: {
+            mimeType: String(source.media_type),
+            data: String(source.data),
+          },
+        }]
+      }
+      if (source.type === 'url' && typeof source.url === 'string') {
+        return [{ text: `[image: ${String(source.url)}]` }]
+      }
+    }
+    if (block.type === 'document' && block.source && typeof block.source === 'object') {
+      const source = block.source as Record<string, unknown>
+      if (source.type === 'text' && typeof source.data === 'string') {
+        return [{ text: String(source.data) }]
+      }
     }
     return []
   })
@@ -179,7 +196,7 @@ export function convertAnthropicRequestToGemini(input: {
   system?: string | Array<{ type?: string; text?: string }>
   messages: BetaMessageParam[]
   tools?: BetaToolUnion[]
-  tool_choice?: BetaToolChoiceAuto | BetaToolChoiceTool
+  tool_choice?: BetaToolChoice
   temperature?: number
   max_tokens?: number
   thinking?: {
@@ -190,18 +207,6 @@ export function convertAnthropicRequestToGemini(input: {
 }): GeminiRequest {
   const toolNameById = getToolNameById(input.messages)
   const contents: GeminiContent[] = []
-  const configuredModel = process.env.ANTHROPIC_MODEL?.trim()
-  void configuredModel
-
-  if (input.system) {
-    const systemText = Array.isArray(input.system)
-      ? input.system.map(block => block.text ?? '').join('\n')
-      : input.system
-
-    if (systemText.trim()) {
-      // kept separately in request body below
-    }
-  }
 
   for (const message of input.messages) {
     const blocks = toBlocks(message.content)
@@ -211,18 +216,33 @@ export function convertAnthropicRequestToGemini(input: {
 
       for (const block of blocks as AnyBlock[]) {
         if (block.type === 'tool_result') {
-          const toolUseId =
-            typeof block.tool_use_id === 'string' ? block.tool_use_id : undefined
-          const toolName = toolUseId ? toolNameById.get(toolUseId) : undefined
+          if (typeof block.tool_use_id !== 'string' || block.tool_use_id.length === 0) {
+            throw new Error('[geminiCompat] tool_result missing tool_use_id — cannot resolve function name')
+          }
+          const toolUseId = block.tool_use_id
+          const toolName = toolNameById.get(toolUseId)
+          if (!toolName) {
+            throw new Error(`[geminiCompat] tool_result references unknown tool_use_id=${toolUseId}`)
+          }
+          const rawContent = block.content
+          let textContent: string
+          if (typeof rawContent === 'string') {
+            textContent = rawContent
+          } else if (Array.isArray(rawContent)) {
+            textContent = (rawContent as AnyBlock[])
+              .map(b => {
+                if (b.type === 'text' && typeof b.text === 'string') return b.text
+                return JSON.stringify(b)
+              })
+              .join('\n')
+          } else {
+            textContent = JSON.stringify(rawContent ?? '')
+          }
+          if (block.is_error === true) textContent = `[tool_error] ${textContent}`
           parts.push({
             functionResponse: {
               name: toolName,
-              response: {
-                content:
-                  typeof block.content === 'string'
-                    ? block.content
-                    : block.content ?? '',
-              },
+              response: { content: textContent },
             },
           })
         }
@@ -252,10 +272,21 @@ export function convertAnthropicRequestToGemini(input: {
       }
 
       if (block.type === 'tool_use') {
+        if (typeof block.name !== 'string' || block.name.length === 0) {
+          throw new Error('[geminiCompat] tool_use missing name — cannot build functionCall')
+        }
+        let args: unknown = block.input ?? {}
+        if (typeof args === 'string') {
+          try {
+            args = args.length > 0 ? JSON.parse(args) : {}
+          } catch {
+            throw new Error(`[geminiCompat] tool_use.input is a string but not valid JSON for tool=${block.name}`)
+          }
+        }
         parts.push({
           functionCall: {
-            name: typeof block.name === 'string' ? block.name : undefined,
-            args: block.input ?? {},
+            name: block.name,
+            args,
           },
         })
       }
@@ -277,8 +308,18 @@ export function convertAnthropicRequestToGemini(input: {
     (input.thinking?.type === 'enabled' || input.thinking?.type === 'adaptive') &&
     thinkingBudget !== 0
 
+  const coalescedContents: GeminiContent[] = []
+  for (const entry of contents) {
+    const prev = coalescedContents[coalescedContents.length - 1]
+    if (prev && prev.role === entry.role) {
+      prev.parts.push(...entry.parts)
+    } else {
+      coalescedContents.push(entry)
+    }
+  }
+
   return {
-    contents,
+    contents: coalescedContents,
     ...(systemText.trim()
       ? {
           systemInstruction: {
@@ -344,6 +385,19 @@ export async function createGeminiCompatStream(
     )
   }
 
+  const contentType = response.headers.get('content-type') ?? ''
+  if (!contentType.includes('text/event-stream')) {
+    let responseText = ''
+    try {
+      responseText = await response.text()
+    } catch {
+      responseText = ''
+    }
+    throw new Error(
+      `Gemini endpoint returned non-streaming response (content-type: ${contentType || 'unknown'}): ${responseText.slice(0, 500)}`,
+    )
+  }
+
   return response.body.getReader()
 }
 
@@ -352,6 +406,15 @@ function mapGeminiFinishReason(reason: string | undefined): BetaMessage['stop_re
   return 'end_turn'
 }
 
+const GEMINI_ERROR_FINISH_REASONS = new Set([
+  'SAFETY',
+  'RECITATION',
+  'BLOCKLIST',
+  'PROHIBITED_CONTENT',
+  'SPII',
+  'MALFORMED_FUNCTION_CALL',
+])
+
 export async function* createAnthropicStreamFromGemini(input: {
   reader: ReadableStreamDefaultReader<Uint8Array>
   model: string
@@ -359,16 +422,16 @@ export async function* createAnthropicStreamFromGemini(input: {
   const decoder = new TextDecoder()
   let buffer = ''
   let started = false
-  let textStarted = false
-  let textContentIndex: number | null = null
-  let thinkingStarted = false
-  let thinkingContentIndex: number | null = null
+  let currentTextIndex: number | null = null
+  let currentThinkingIndex: number | null = null
+  let thinkingSignature = ''
   let nextContentIndex = 0
   let promptTokens = 0
   let completionTokens = 0
   let emittedAnyContent = false
   let stopReason: BetaMessage['stop_reason'] = 'end_turn'
   let toolCounter = 0
+  const bufferedToolCalls: Array<{ id: string; name: string; args: unknown }> = []
 
   while (true) {
     const { done, value } = await input.reader.read()
@@ -389,10 +452,25 @@ export async function* createAnthropicStreamFromGemini(input: {
         if (!chunk || typeof chunk !== 'object') {
           throw new Error(`[geminiCompat] invalid stream chunk: ${String(data).slice(0, 500)}`)
         }
+        if (chunk.error) {
+          const msg = chunk.error.message || chunk.error.status || JSON.stringify(chunk.error)
+          throw new Error(`[geminiCompat] stream error: ${msg}`)
+        }
+        if (chunk.promptFeedback?.blockReason) {
+          const reason = chunk.promptFeedback.blockReason
+          const detail = chunk.promptFeedback.blockReasonMessage
+          throw new Error(
+            `[geminiCompat] prompt blocked: ${reason}${detail ? ` — ${detail}` : ''}`,
+          )
+        }
+
+        if (chunk.usageMetadata) {
+          promptTokens = chunk.usageMetadata.promptTokenCount ?? promptTokens
+          completionTokens = chunk.usageMetadata.candidatesTokenCount ?? completionTokens
+        }
 
         if (!started) {
           started = true
-          promptTokens = chunk.usageMetadata?.promptTokenCount ?? 0
           yield {
             type: 'message_start',
             message: {
@@ -415,99 +493,82 @@ export async function* createAnthropicStreamFromGemini(input: {
         const parts = candidate?.content?.parts ?? []
 
         for (const part of parts) {
-          if (typeof part.text === 'string' && part.text.length > 0 && part.thought) {
-            if (!thinkingStarted) {
-              thinkingStarted = true
-              thinkingContentIndex = nextContentIndex
-              nextContentIndex += 1
+          const isThought = part.thought === true
+          const hasText = typeof part.text === 'string' && part.text.length > 0
+
+          if (hasText && isThought) {
+            if (currentTextIndex !== null) {
+              yield { type: 'content_block_stop', index: currentTextIndex } as BetaRawMessageStreamEvent
+              currentTextIndex = null
+            }
+            if (currentThinkingIndex === null) {
+              currentThinkingIndex = nextContentIndex++
+              if (typeof part.thoughtSignature === 'string') thinkingSignature = part.thoughtSignature
               yield {
                 type: 'content_block_start',
-                index: thinkingContentIndex,
-                content_block: {
-                  type: 'thinking',
-                  thinking: '',
-                  signature: typeof part.thoughtSignature === 'string' ? part.thoughtSignature : '',
-                },
+                index: currentThinkingIndex,
+                content_block: { type: 'thinking', thinking: '', signature: thinkingSignature },
+              } as BetaRawMessageStreamEvent
+            } else if (typeof part.thoughtSignature === 'string' && part.thoughtSignature !== thinkingSignature) {
+              thinkingSignature = part.thoughtSignature
+              yield {
+                type: 'content_block_delta',
+                index: currentThinkingIndex,
+                delta: { type: 'signature_delta', signature: thinkingSignature },
               } as BetaRawMessageStreamEvent
             }
-
             yield {
               type: 'content_block_delta',
-              index: thinkingContentIndex ?? 0,
-              delta: {
-                type: 'thinking_delta',
-                thinking: part.text,
-              },
+              index: currentThinkingIndex,
+              delta: { type: 'thinking_delta', thinking: part.text as string },
             } as BetaRawMessageStreamEvent
             emittedAnyContent = true
             continue
           }
 
-          if (typeof part.text === 'string' && part.text.length > 0) {
-            if (!textStarted) {
-              textStarted = true
-              textContentIndex = nextContentIndex
-              nextContentIndex += 1
+          if (hasText) {
+            if (currentThinkingIndex !== null) {
+              yield { type: 'content_block_stop', index: currentThinkingIndex } as BetaRawMessageStreamEvent
+              currentThinkingIndex = null
+            }
+            if (currentTextIndex === null) {
+              currentTextIndex = nextContentIndex++
               yield {
                 type: 'content_block_start',
-                index: textContentIndex,
-                content_block: {
-                  type: 'text',
-                  text: '',
-                },
+                index: currentTextIndex,
+                content_block: { type: 'text', text: '' },
               } as BetaRawMessageStreamEvent
             }
-
             yield {
               type: 'content_block_delta',
-              index: textContentIndex ?? 0,
-              delta: {
-                type: 'text_delta',
-                text: part.text,
-              },
+              index: currentTextIndex,
+              delta: { type: 'text_delta', text: part.text as string },
             } as BetaRawMessageStreamEvent
             emittedAnyContent = true
           }
 
           if (part.functionCall) {
-            const anthropicIndex = nextContentIndex
-            nextContentIndex += 1
             toolCounter += 1
-            yield {
-              type: 'content_block_start',
-              index: anthropicIndex,
-              content_block: {
-                type: 'tool_use',
-                id: `toolu_gemini_${toolCounter}`,
-                name: part.functionCall.name ?? '',
-                input: '',
-              },
-            } as BetaRawMessageStreamEvent
-
-            const argsJson = JSON.stringify(part.functionCall.args ?? {})
-            yield {
-              type: 'content_block_delta',
-              index: anthropicIndex,
-              delta: {
-                type: 'input_json_delta',
-                partial_json: argsJson,
-              },
-            } as BetaRawMessageStreamEvent
-            yield {
-              type: 'content_block_stop',
-              index: anthropicIndex,
-            } as BetaRawMessageStreamEvent
-            emittedAnyContent = true
-            stopReason = 'tool_use'
+            bufferedToolCalls.push({
+              id: `toolu_gemini_${toolCounter}`,
+              name: part.functionCall.name ?? '',
+              args: part.functionCall.args ?? {},
+            })
+            if (stopReason !== 'max_tokens') stopReason = 'tool_use'
           }
         }
 
         if (candidate?.finishReason) {
-          stopReason = stopReason === 'tool_use' ? 'tool_use' : mapGeminiFinishReason(candidate.finishReason)
+          if (GEMINI_ERROR_FINISH_REASONS.has(candidate.finishReason)) {
+            throw new Error(
+              `[geminiCompat] generation stopped: ${candidate.finishReason}`,
+            )
+          }
+          const mapped = mapGeminiFinishReason(candidate.finishReason)
+          if (mapped === 'max_tokens' || stopReason !== 'tool_use') {
+            stopReason = mapped
+          }
         }
-
-        promptTokens = chunk.usageMetadata?.promptTokenCount ?? promptTokens
-        completionTokens = chunk.usageMetadata?.candidatesTokenCount ?? completionTokens
       }
     }
   }
@@ -516,49 +577,51 @@ export async function* createAnthropicStreamFromGemini(input: {
     throw new Error(`[geminiCompat] stream ended before message_start for model=${input.model}`)
   }
 
-  if (!emittedAnyContent) {
+  if (currentTextIndex !== null) {
+    yield { type: 'content_block_stop', index: currentTextIndex } as BetaRawMessageStreamEvent
+    currentTextIndex = null
+  }
+  if (currentThinkingIndex !== null) {
+    yield { type: 'content_block_stop', index: currentThinkingIndex } as BetaRawMessageStreamEvent
+    currentThinkingIndex = null
+  }
+
+  for (const tool of bufferedToolCalls) {
+    if (!tool.name) {
+      throw new Error('[geminiCompat] functionCall missing name in stream')
+    }
+    const idx = nextContentIndex++
     yield {
       type: 'content_block_start',
-      index: 0,
-      content_block: {
-        type: 'text',
-        text: '',
-      },
+      index: idx,
+      content_block: { type: 'tool_use', id: tool.id, name: tool.name, input: {} },
     } as BetaRawMessageStreamEvent
     yield {
-      type: 'content_block_stop',
-      index: 0,
+      type: 'content_block_delta',
+      index: idx,
+      delta: { type: 'input_json_delta', partial_json: JSON.stringify(tool.args ?? {}) },
     } as BetaRawMessageStreamEvent
+    yield { type: 'content_block_stop', index: idx } as BetaRawMessageStreamEvent
+    emittedAnyContent = true
   }
 
-  if (textStarted && textContentIndex !== null) {
+  if (!emittedAnyContent) {
+    const idx = nextContentIndex++
     yield {
-      type: 'content_block_stop',
-      index: textContentIndex,
+      type: 'content_block_start',
+      index: idx,
+      content_block: { type: 'text', text: '' },
     } as BetaRawMessageStreamEvent
-  }
-
-  if (thinkingStarted && thinkingContentIndex !== null) {
-    yield {
-      type: 'content_block_stop',
-      index: thinkingContentIndex,
-    } as BetaRawMessageStreamEvent
+    yield { type: 'content_block_stop', index: idx } as BetaRawMessageStreamEvent
   }
 
   yield {
     type: 'message_delta',
-    delta: {
-      stop_reason: stopReason,
-      stop_sequence: null,
-    },
-    usage: {
-      output_tokens: completionTokens,
-    },
+    delta: { stop_reason: stopReason, stop_sequence: null },
+    usage: { output_tokens: completionTokens },
   } as BetaRawMessageStreamEvent
 
-  yield {
-    type: 'message_stop',
-  } as BetaRawMessageStreamEvent
+  yield { type: 'message_stop' } as BetaRawMessageStreamEvent
 
   return {
     id: 'gemini-compat',

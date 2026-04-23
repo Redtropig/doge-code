@@ -2,8 +2,7 @@ import type {
   BetaMessage,
   BetaMessageParam,
   BetaRawMessageStreamEvent,
-  BetaToolChoiceAuto,
-  BetaToolChoiceTool,
+  BetaToolChoice,
   BetaToolUnion,
   BetaUsage,
 } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
@@ -52,7 +51,11 @@ export type OpenAIChatRequest = {
       parameters?: unknown
     }
   }>
-  tool_choice?: 'auto' | { type: 'function'; function: { name: string } }
+  tool_choice?:
+    | 'auto'
+    | 'required'
+    | 'none'
+    | { type: 'function'; function: { name: string } }
   max_tokens?: number
 }
 
@@ -121,26 +124,36 @@ function mapAnthropicUserBlocksToOpenAIContent(
     if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
       return [{ type: 'text' as const, text: block.text }]
     }
-    if (
-      block.type === 'image' &&
-      block.source &&
-      typeof block.source === 'object' &&
-      (block.source as Record<string, unknown>).type === 'base64' &&
-      typeof (block.source as Record<string, unknown>).media_type === 'string' &&
-      typeof (block.source as Record<string, unknown>).data === 'string'
-    ) {
-      return [{
-        type: 'image_url' as const,
-        image_url: {
-          url: toDataUrl(
-            String((block.source as Record<string, unknown>).media_type),
-            String((block.source as Record<string, unknown>).data),
-          ),
-        },
-      }]
+    if (block.type === 'image' && block.source && typeof block.source === 'object') {
+      const source = block.source as Record<string, unknown>
+      if (
+        source.type === 'base64' &&
+        typeof source.media_type === 'string' &&
+        typeof source.data === 'string'
+      ) {
+        return [{
+          type: 'image_url' as const,
+          image_url: { url: toDataUrl(String(source.media_type), String(source.data)) },
+        }]
+      }
+      if (source.type === 'url' && typeof source.url === 'string') {
+        return [{ type: 'image_url' as const, image_url: { url: String(source.url) } }]
+      }
+    }
+    if (block.type === 'document' && block.source && typeof block.source === 'object') {
+      const source = block.source as Record<string, unknown>
+      if (source.type === 'text' && typeof source.data === 'string') {
+        return [{ type: 'text' as const, text: String(source.data) }]
+      }
     }
     return []
   })
+}
+
+function stripSchemaMetaKeys(schema: unknown): unknown {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return schema
+  const { $schema: _s, $id: _i, ...rest } = schema as Record<string, unknown>
+  return rest
 }
 
 export function getToolDefinitions(tools?: BetaToolUnion[]): OpenAIChatRequest['tools'] {
@@ -155,7 +168,7 @@ export function getToolDefinitions(tools?: BetaToolUnion[]): OpenAIChatRequest['
         name,
         description:
           typeof record.description === 'string' ? record.description : undefined,
-        parameters: record.input_schema,
+        parameters: stripSchemaMetaKeys(record.input_schema),
       },
     }]
   })
@@ -167,7 +180,7 @@ export function convertAnthropicRequestToOpenAI(input: {
   system?: string | Array<{ type?: string; text?: string }>
   messages: BetaMessageParam[]
   tools?: BetaToolUnion[]
-  tool_choice?: BetaToolChoiceAuto | BetaToolChoiceTool
+  tool_choice?: BetaToolChoice
   temperature?: number
   max_tokens?: number
   thinking?: {
@@ -192,13 +205,29 @@ export function convertAnthropicRequestToOpenAI(input: {
 
       const toolResults = blocks.filter(block => block.type === 'tool_result')
       for (const result of toolResults) {
-        const toolUseId =
-          typeof result.tool_use_id === 'string' ? result.tool_use_id : undefined
-        const content = result.content
+        if (typeof result.tool_use_id !== 'string' || result.tool_use_id.length === 0) {
+          throw new Error('[openaiCompat] tool_result missing tool_use_id — cannot correlate with tool_call')
+        }
+        const toolUseId = result.tool_use_id
+        const rawContent = result.content
+        let textContent: string
+        if (typeof rawContent === 'string') {
+          textContent = rawContent
+        } else if (Array.isArray(rawContent)) {
+          textContent = (rawContent as AnyBlock[])
+            .map(b => {
+              if (b.type === 'text' && typeof b.text === 'string') return b.text
+              return JSON.stringify(b)
+            })
+            .join('\n')
+        } else {
+          textContent = JSON.stringify(rawContent ?? '')
+        }
+        if (result.is_error === true) textContent = `[tool_error] ${textContent}`
         messages.push({
           role: 'tool',
           tool_call_id: toolUseId,
-          content: typeof content === 'string' ? content : JSON.stringify(content),
+          content: textContent,
         })
       }
 
@@ -232,19 +261,23 @@ export function convertAnthropicRequestToOpenAI(input: {
           },
         }))
 
-      messages.push({
-        role: 'assistant',
-        content: text || null,
-        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
-      })
+      if (text || toolCalls.length > 0) {
+        messages.push({
+          role: 'assistant',
+          content: text || null,
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+        })
+      }
     }
   }
 
+  const thinkingEnabled =
+    input.thinking?.type === 'enabled' || input.thinking?.type === 'adaptive'
+  const toolChoiceType = input.tool_choice?.type
   return {
     model: targetModel,
     messages,
-    enable_thinking:
-      input.thinking?.type === 'enabled' || input.thinking?.type === 'adaptive',
+    ...(thinkingEnabled ? { enable_thinking: true } : {}),
     ...(input.thinking?.type === 'enabled' &&
     typeof input.thinking.budget_tokens === 'number'
       ? { thinking_budget: input.thinking.budget_tokens }
@@ -254,16 +287,20 @@ export function convertAnthropicRequestToOpenAI(input: {
     ...(getToolDefinitions(input.tools)
       ? { tools: getToolDefinitions(input.tools) }
       : {}),
-    ...(input.tool_choice?.type === 'tool'
+    ...(toolChoiceType === 'tool' && input.tool_choice?.type === 'tool'
       ? {
           tool_choice: {
             type: 'function' as const,
             function: { name: input.tool_choice.name },
           },
         }
-      : input.tool_choice?.type === 'auto'
+      : toolChoiceType === 'auto'
         ? { tool_choice: 'auto' as const }
-        : {}),
+        : toolChoiceType === 'any'
+          ? { tool_choice: 'required' as const }
+          : toolChoiceType === 'none'
+            ? { tool_choice: 'none' as const }
+            : {}),
   }
 }
 
@@ -298,6 +335,19 @@ export async function createOpenAICompatStream(
     )
   }
 
+  const contentType = response.headers.get('content-type') ?? ''
+  if (!contentType.includes('text/event-stream')) {
+    let responseText = ''
+    try {
+      responseText = await response.text()
+    } catch {
+      responseText = ''
+    }
+    throw new Error(
+      `OpenAI compatible endpoint returned non-streaming response (content-type: ${contentType || 'unknown'}): ${responseText.slice(0, 500)}`,
+    )
+  }
+
   return response.body.getReader()
 }
 
@@ -321,16 +371,17 @@ export async function* createAnthropicStreamFromOpenAI(input: {
   const decoder = new TextDecoder()
   let buffer = ''
   let started = false
-  let textStarted = false
-  let textContentIndex: number | null = null
-  let thinkingStarted = false
-  let thinkingContentIndex: number | null = null
-  let toolIndexByOpenAIIndex = new Map<number, number>()
+  let currentTextIndex: number | null = null
+  let currentThinkingIndex: number | null = null
   let nextContentIndex = 0
   let promptTokens = 0
   let completionTokens = 0
   let emittedAnyContent = false
+  let responseId = 'openai-compat'
+  let stopReason: BetaMessage['stop_reason'] = 'end_turn'
+  let finishSeen = false
   const toolCallState = new Map<number, { id: string; name: string; arguments: string }>()
+  const toolCallOrder: number[] = []
 
   while (true) {
     const { done, value } = await input.reader.read()
@@ -347,28 +398,34 @@ export async function* createAnthropicStreamFromOpenAI(input: {
 
       for (const data of dataLines) {
         if (!data || data === '[DONE]') continue
-        const chunk = JSON.parse(data) as OpenAIStreamChunk
+        const chunk = JSON.parse(data) as OpenAIStreamChunk & {
+          error?: { message?: string; code?: string | number; type?: string }
+        }
         if (!chunk || typeof chunk !== 'object') {
           throw new Error(
             `[openaiCompat] invalid stream chunk: ${String(data).slice(0, 500)}`,
           )
         }
-        const choice = chunk.choices?.[0]
-        const delta = choice?.delta
-
-        if (!choice && data !== '[DONE]') {
-          throw new Error(
-            `[openaiCompat] chunk missing choices[0]: ${JSON.stringify(chunk).slice(0, 1000)}`,
-          )
+        if (chunk.error) {
+          const msg =
+            chunk.error.message ||
+            chunk.error.type ||
+            JSON.stringify(chunk.error).slice(0, 500)
+          throw new Error(`[openaiCompat] stream error: ${msg}`)
         }
+
+        if (chunk.usage) {
+          promptTokens = chunk.usage.prompt_tokens ?? promptTokens
+          completionTokens = chunk.usage.completion_tokens ?? completionTokens
+        }
+        if (chunk.id) responseId = chunk.id
 
         if (!started) {
           started = true
-          promptTokens = chunk.usage?.prompt_tokens ?? 0
           yield {
             type: 'message_start',
             message: {
-              id: chunk.id ?? 'openai-compat',
+              id: responseId,
               type: 'message',
               role: 'assistant',
               model: input.model,
@@ -383,175 +440,148 @@ export async function* createAnthropicStreamFromOpenAI(input: {
           } as BetaRawMessageStreamEvent
         }
 
-        if (delta?.content) {
-          if (!textStarted) {
-            textStarted = true
-            textContentIndex = nextContentIndex
-            nextContentIndex += 1
+        const choice = chunk.choices?.[0]
+        if (!choice) continue
+        const delta = choice.delta
+
+        if (delta?.reasoning_content) {
+          if (currentTextIndex !== null) {
+            yield { type: 'content_block_stop', index: currentTextIndex } as BetaRawMessageStreamEvent
+            currentTextIndex = null
+          }
+          if (currentThinkingIndex === null) {
+            currentThinkingIndex = nextContentIndex++
             yield {
               type: 'content_block_start',
-              index: textContentIndex,
-              content_block: {
-                type: 'text',
-                text: '',
-              },
+              index: currentThinkingIndex,
+              content_block: { type: 'thinking', thinking: '', signature: '' },
             } as BetaRawMessageStreamEvent
           }
-
           yield {
             type: 'content_block_delta',
-            index: textContentIndex ?? 0,
-            delta: {
-              type: 'text_delta',
-              text: delta.content,
-            },
+            index: currentThinkingIndex,
+            delta: { type: 'thinking_delta', thinking: delta.reasoning_content },
           } as BetaRawMessageStreamEvent
           emittedAnyContent = true
         }
 
-        if (delta?.reasoning_content) {
-          if (!thinkingStarted) {
-            thinkingStarted = true
-            thinkingContentIndex = nextContentIndex
-            nextContentIndex += 1
+        if (delta?.content) {
+          if (currentThinkingIndex !== null) {
+            yield { type: 'content_block_stop', index: currentThinkingIndex } as BetaRawMessageStreamEvent
+            currentThinkingIndex = null
+          }
+          if (currentTextIndex === null) {
+            currentTextIndex = nextContentIndex++
             yield {
               type: 'content_block_start',
-              index: thinkingContentIndex,
-              content_block: {
-                type: 'thinking',
-                thinking: '',
-                signature: '',
-              },
+              index: currentTextIndex,
+              content_block: { type: 'text', text: '' },
             } as BetaRawMessageStreamEvent
           }
-
           yield {
             type: 'content_block_delta',
-            index: thinkingContentIndex ?? 0,
-            delta: {
-              type: 'thinking_delta',
-              thinking: delta.reasoning_content,
-            },
+            index: currentTextIndex,
+            delta: { type: 'text_delta', text: delta.content },
           } as BetaRawMessageStreamEvent
           emittedAnyContent = true
         }
 
         for (const toolCall of delta?.tool_calls ?? []) {
           const openAIIndex = toolCall.index ?? 0
-          let anthropicIndex = toolIndexByOpenAIIndex.get(openAIIndex)
-          if (anthropicIndex === undefined) {
-            anthropicIndex = nextContentIndex
-            toolIndexByOpenAIIndex.set(openAIIndex, anthropicIndex)
-            nextContentIndex = Math.max(nextContentIndex, anthropicIndex + 1)
-            const state = {
-              id: toolCall.id ?? `toolu_${openAIIndex}`,
+          let state = toolCallState.get(openAIIndex)
+          if (!state) {
+            state = {
+              id: toolCall.id ?? `toolu_openai_${openAIIndex}`,
               name: toolCall.function?.name ?? '',
               arguments: '',
             }
             toolCallState.set(openAIIndex, state)
-            yield {
-              type: 'content_block_start',
-              index: anthropicIndex,
-              content_block: {
-                type: 'tool_use',
-                id: state.id,
-                name: state.name,
-                input: '',
-              },
-            } as BetaRawMessageStreamEvent
+            toolCallOrder.push(openAIIndex)
           }
-
-          const state = toolCallState.get(openAIIndex)
-          if (!state) continue
           if (toolCall.id) state.id = toolCall.id
           if (toolCall.function?.name) state.name = toolCall.function.name
-          if (toolCall.function?.arguments) {
-            state.arguments += toolCall.function.arguments
-            yield {
-              type: 'content_block_delta',
-              index: anthropicIndex,
-              delta: {
-                type: 'input_json_delta',
-                partial_json: toolCall.function.arguments,
-              },
-            } as BetaRawMessageStreamEvent
-            emittedAnyContent = true
-          }
+          if (toolCall.function?.arguments) state.arguments += toolCall.function.arguments
         }
 
-        if (choice?.finish_reason) {
-          if (!emittedAnyContent) {
-            yield {
-              type: 'content_block_start',
-              index: 0,
-              content_block: {
-                type: 'text',
-                text: '',
-              },
-            } as BetaRawMessageStreamEvent
-            yield {
-              type: 'content_block_stop',
-              index: 0,
-            } as BetaRawMessageStreamEvent
-          }
-          completionTokens = chunk.usage?.completion_tokens ?? completionTokens
-          if (textStarted && textContentIndex !== null) {
-            yield {
-              type: 'content_block_stop',
-              index: textContentIndex,
-            } as BetaRawMessageStreamEvent
-          }
-
-          if (thinkingStarted && thinkingContentIndex !== null) {
-            yield {
-              type: 'content_block_stop',
-              index: thinkingContentIndex,
-            } as BetaRawMessageStreamEvent
-          }
-
-          for (const anthropicIndex of toolIndexByOpenAIIndex.values()) {
-            yield {
-              type: 'content_block_stop',
-              index: anthropicIndex,
-            } as BetaRawMessageStreamEvent
-          }
-
-          yield {
-            type: 'message_delta',
-            delta: {
-              stop_reason: mapFinishReason(choice.finish_reason),
-              stop_sequence: null,
-            },
-            usage: {
-              output_tokens: completionTokens,
-            },
-          } as BetaRawMessageStreamEvent
-
-          yield {
-            type: 'message_stop',
-          } as BetaRawMessageStreamEvent
-
-          return {
-            id: chunk.id ?? 'openai-compat',
-            type: 'message',
-            role: 'assistant',
-            model: input.model,
-            content: [],
-            stop_reason: mapFinishReason(choice.finish_reason),
-            stop_sequence: null,
-            usage: {
-              input_tokens: promptTokens,
-              output_tokens: completionTokens,
-            },
-          } as BetaMessage
+        if (choice.finish_reason && !finishSeen) {
+          finishSeen = true
+          stopReason = mapFinishReason(choice.finish_reason)
         }
       }
     }
   }
 
-  throw new Error(
-    `[openaiCompat] stream ended unexpectedly before message_stop for model=${input.model}`,
-  )
+  if (!started) {
+    throw new Error(
+      `[openaiCompat] stream ended before any event for model=${input.model}`,
+    )
+  }
+
+  if (currentTextIndex !== null) {
+    yield { type: 'content_block_stop', index: currentTextIndex } as BetaRawMessageStreamEvent
+    currentTextIndex = null
+  }
+  if (currentThinkingIndex !== null) {
+    yield { type: 'content_block_stop', index: currentThinkingIndex } as BetaRawMessageStreamEvent
+    currentThinkingIndex = null
+  }
+
+  for (const openAIIndex of toolCallOrder) {
+    const state = toolCallState.get(openAIIndex)
+    if (!state) continue
+    if (!state.name) {
+      throw new Error(`[openaiCompat] tool_call at index ${openAIIndex} has no name`)
+    }
+    const idx = nextContentIndex++
+    yield {
+      type: 'content_block_start',
+      index: idx,
+      content_block: { type: 'tool_use', id: state.id, name: state.name, input: {} },
+    } as BetaRawMessageStreamEvent
+    yield {
+      type: 'content_block_delta',
+      index: idx,
+      delta: { type: 'input_json_delta', partial_json: state.arguments || '{}' },
+    } as BetaRawMessageStreamEvent
+    yield { type: 'content_block_stop', index: idx } as BetaRawMessageStreamEvent
+    emittedAnyContent = true
+  }
+
+  if (toolCallOrder.length > 0 && stopReason !== 'max_tokens') {
+    stopReason = 'tool_use'
+  }
+
+  if (!emittedAnyContent) {
+    const idx = nextContentIndex++
+    yield {
+      type: 'content_block_start',
+      index: idx,
+      content_block: { type: 'text', text: '' },
+    } as BetaRawMessageStreamEvent
+    yield { type: 'content_block_stop', index: idx } as BetaRawMessageStreamEvent
+  }
+
+  yield {
+    type: 'message_delta',
+    delta: { stop_reason: stopReason, stop_sequence: null },
+    usage: { output_tokens: completionTokens },
+  } as BetaRawMessageStreamEvent
+
+  yield { type: 'message_stop' } as BetaRawMessageStreamEvent
+
+  return {
+    id: responseId,
+    type: 'message',
+    role: 'assistant',
+    model: input.model,
+    content: [],
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: promptTokens,
+      output_tokens: completionTokens,
+    },
+  } as BetaMessage
 }
 
 export function mapOpenAIUsageToAnthropic(usage?: {
