@@ -826,7 +826,9 @@ export function getAssistantMessageFromError(
     // Check if the API key is from an external source
     const { source } = getAnthropicApiKeyWithSource()
     const isExternalSource =
-      source === 'DOGE_API_KEY' || source === 'apiKeyHelper'
+      source === 'DOGE_API_KEY' ||
+      source === 'customApiEndpoint' ||
+      source === 'apiKeyHelper'
 
     return createAssistantAPIErrorMessage({
       error: 'authentication_failed',

@@ -132,7 +132,9 @@ export function isAnthropicAuthEnabled(): boolean {
     skipRetrievingKeyFromApiKeyHelper: true,
   })
   const hasExternalApiKey =
-    apiKeySource === 'DOGE_API_KEY' || apiKeySource === 'apiKeyHelper'
+    apiKeySource === 'DOGE_API_KEY' ||
+    apiKeySource === 'customApiEndpoint' ||
+    apiKeySource === 'apiKeyHelper'
 
   // Disable Anthropic auth if:
   // 1. Using 3rd party services (Bedrock/Vertex/Foundry)
@@ -208,6 +210,7 @@ export function getAuthTokenSource() {
 
 export type ApiKeySource =
   | 'DOGE_API_KEY'
+  | 'customApiEndpoint'
   | 'apiKeyHelper'
   | '/login managed key'
   | 'none'
@@ -257,13 +260,16 @@ export function getAnthropicApiKeyWithSource(
   const persistedCustomApiKey =
     readCustomApiStorage().apiKey || getGlobalConfig().customApiEndpoint?.apiKey
   const effectiveApiKeyEnv = apiKeyEnv || persistedCustomApiKey
+  const effectiveApiKeySource: ApiKeySource = apiKeyEnv
+    ? 'DOGE_API_KEY'
+    : 'customApiEndpoint'
 
   // Always check for direct environment variable when the user ran claude --print.
   // This is useful for CI, etc.
   if (preferThirdPartyAuthentication() && effectiveApiKeyEnv) {
     return {
       key: effectiveApiKeyEnv,
-      source: 'DOGE_API_KEY',
+      source: effectiveApiKeySource,
     }
   }
 
@@ -290,7 +296,7 @@ export function getAnthropicApiKeyWithSource(
     if (effectiveApiKeyEnv) {
       return {
         key: effectiveApiKeyEnv,
-        source: 'DOGE_API_KEY',
+        source: effectiveApiKeySource,
       }
     }
 
@@ -309,7 +315,7 @@ export function getAnthropicApiKeyWithSource(
   ) {
     return {
       key: effectiveApiKeyEnv,
-      source: 'DOGE_API_KEY',
+      source: effectiveApiKeySource,
     }
   }
 

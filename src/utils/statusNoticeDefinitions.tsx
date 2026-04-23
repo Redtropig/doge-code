@@ -98,15 +98,7 @@ const apiKeyConflictNotice: StatusNoticeDefinition = {
 const bothAuthMethodsNotice: StatusNoticeDefinition = {
   id: 'both-auth-methods',
   type: 'warning',
-  isActive: () => {
-    const {
-      source: apiKeySource
-    } = getAnthropicApiKeyWithSource({
-      skipRetrievingKeyFromApiKeyHelper: true
-    });
-    const authTokenInfo = getAuthTokenSource();
-    return apiKeySource !== 'none' && authTokenInfo.source !== 'none' && !(apiKeySource === 'apiKeyHelper' && authTokenInfo.source === 'apiKeyHelper');
-  },
+  isActive: () => false,  // !!! doge-code never uses claude.ai subscription
   render: () => {
     const {
       source: apiKeySource

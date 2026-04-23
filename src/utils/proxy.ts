@@ -56,13 +56,58 @@ export function getAddressFamily(options: LookupOptions): 0 | 4 | 6 {
 
 type EnvLike = Record<string, string | undefined>
 
+// null = not yet probed; undefined = probed, no system proxy
+let cachedSystemProxyUrl: string | undefined | null = null
+
+function getSystemProxyUrl(): string | undefined {
+  if (!isEnvTruthy(process.env.DOGE_DETECT_SYSTEM_PROXY)) return undefined
+  if (cachedSystemProxyUrl !== null) return cachedSystemProxyUrl ?? undefined
+  if (process.platform !== 'darwin') {
+    cachedSystemProxyUrl = undefined
+    return undefined
+  }
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { execFileSync } = require('child_process') as typeof import('child_process')
+    const output = execFileSync('scutil', ['--proxy'], {
+      encoding: 'utf8',
+      timeout: 2000,
+    })
+    const pick = (enableKey: string, hostKey: string, portKey: string): string | undefined => {
+      const enabled = new RegExp(`${enableKey}\\s*:\\s*1`).test(output)
+      if (!enabled) return undefined
+      const host = output.match(new RegExp(`${hostKey}\\s*:\\s*(\\S+)`))?.[1]
+      const port = output.match(new RegExp(`${portKey}\\s*:\\s*(\\d+)`))?.[1]
+      return host && port ? `http://${host}:${port}` : undefined
+    }
+    const detected =
+      pick('HTTPSEnable', 'HTTPSProxy', 'HTTPSPort') ??
+      pick('HTTPEnable', 'HTTPProxy', 'HTTPPort')
+    cachedSystemProxyUrl = detected
+    if (detected) {
+      logForDebugging(`Detected macOS system proxy via scutil: ${detected}`)
+    }
+    return detected
+  } catch (error) {
+    logForDebugging(`scutil --proxy failed: ${String(error)}`)
+    cachedSystemProxyUrl = undefined
+    return undefined
+  }
+}
+
 /**
  * Get the active proxy URL if one is configured
  * Prefers lowercase variants over uppercase (https_proxy > HTTPS_PROXY > http_proxy > HTTP_PROXY)
+ * Falls back to the OS-level proxy (macOS scutil) when DOGE_DETECT_SYSTEM_PROXY is set.
  * @param env Environment variables to check (defaults to process.env for production use)
  */
 export function getProxyUrl(env: EnvLike = process.env): string | undefined {
-  return env.https_proxy || env.HTTPS_PROXY || env.http_proxy || env.HTTP_PROXY
+  const envUrl =
+    env.https_proxy || env.HTTPS_PROXY || env.http_proxy || env.HTTP_PROXY
+  if (envUrl) return envUrl
+  // Only probe system proxy for the real process env; mock envs in tests skip it.
+  if (env === process.env) return getSystemProxyUrl()
+  return undefined
 }
 
 /**
@@ -423,4 +468,28 @@ export async function getAWSClientProxyConfig(): Promise<object> {
 export function clearProxyCache(): void {
   getProxyAgent.cache.clear?.()
   logForDebugging('Cleared proxy agent cache')
+}
+
+// Bun's native fetch ignores undici's global dispatcher, so the `proxy` option
+// must be merged per-request. On Node the global dispatcher already handles it.
+export function createProxyAwareFetch(): typeof globalThis.fetch {
+  const proxyUrl = getProxyUrl()
+  if (!proxyUrl) return globalThis.fetch
+  if (typeof Bun === 'undefined') return globalThis.fetch
+
+  return ((input, init) => {
+    const url =
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url
+    if (shouldBypassProxy(url)) {
+      return globalThis.fetch(input, init)
+    }
+    return globalThis.fetch(input, {
+      ...init,
+      proxy: proxyUrl,
+    } as RequestInit & { proxy?: string })
+  }) as typeof globalThis.fetch
 }

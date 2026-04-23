@@ -253,7 +253,7 @@ export async function authStatus(opts: {
     authMethod = 'api_key_helper'
   } else if (authTokenSource !== 'none') {
     authMethod = 'oauth_token'
-  } else if (apiKeySource === 'DOGE_API_KEY' || hasApiKeyEnvVar) {
+  } else if (apiKeySource === 'DOGE_API_KEY' || apiKeySource === 'customApiEndpoint' || hasApiKeyEnvVar) {
     authMethod = 'api_key'
   } else if (apiKeySource === '/login managed key') {
     authMethod = 'claude.ai'

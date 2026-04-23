@@ -25,6 +25,7 @@ import {
   isFirstPartyAnthropicBaseUrl,
 } from 'src/utils/model/providers.js'
 import { readCustomApiStorage } from 'src/utils/customApiStorage.js'
+import { createProxyAwareFetch } from 'src/utils/proxy.js'
 import {
   convertAnthropicRequestToGemini,
   createAnthropicStreamFromGemini,
@@ -1846,12 +1847,13 @@ async function* queryModel(
           }
           const reader = await createGeminiCompatStream(
             {
-              apiKey: process.env.DOGE_API_KEY || '',
-              baseURL: process.env.ANTHROPIC_BASE_URL || '',
+              apiKey: customApiConfig.apiKey || process.env.DOGE_API_KEY || '',
+              baseURL:
+                customApiConfig.baseURL || process.env.ANTHROPIC_BASE_URL || '',
               headers: clientRequestId
                 ? { [CLIENT_REQUEST_ID_HEADER]: clientRequestId }
                 : undefined,
-              fetch: globalThis.fetch,
+              fetch: createProxyAwareFetch(),
             },
             process.env.ANTHROPIC_MODEL?.trim() || params.model,
             geminiRequest,
@@ -1865,12 +1867,13 @@ async function* queryModel(
         }
         if (compatProvider === 'openai') {
           const compatConfig = {
-            apiKey: process.env.DOGE_API_KEY || '',
-            baseURL: process.env.ANTHROPIC_BASE_URL || '',
+            apiKey: customApiConfig.apiKey || process.env.DOGE_API_KEY || '',
+            baseURL:
+              customApiConfig.baseURL || process.env.ANTHROPIC_BASE_URL || '',
             headers: clientRequestId
               ? { [CLIENT_REQUEST_ID_HEADER]: clientRequestId }
               : undefined,
-            fetch: globalThis.fetch,
+            fetch: createProxyAwareFetch(),
           }
 
           if (openAICompatMode === 'responses') {
