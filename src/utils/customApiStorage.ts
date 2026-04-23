@@ -4,6 +4,18 @@ export type OpenAICompatMode = 'chat_completions' | 'responses'
 
 export type CustomApiProvider = 'anthropic' | 'openai' | 'gemini'
 
+export function getGlobalCompatProvider(baseURL?: string): CustomApiProvider {
+  const url = baseURL || process.env.ANTHROPIC_BASE_URL || ''
+  if (url.includes('integrate.api.nvidia.com')) {
+    return 'openai'
+  }
+  return process.env.CLAUDE_CODE_COMPATIBLE_API_PROVIDER === 'openai'
+    ? 'openai'
+    : process.env.CLAUDE_CODE_COMPATIBLE_API_PROVIDER === 'gemini'
+      ? 'gemini'
+      : 'anthropic'
+}
+
 export type CustomApiStorageData = {
   provider?: CustomApiProvider
   openaiCompatMode?: OpenAICompatMode

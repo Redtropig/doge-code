@@ -1,9 +1,10 @@
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import { isUltrathinkEnabled } from './thinking.js'
+import { getGlobalConfig } from './config.js'
 import { getInitialSettings } from './settings/settings.js'
 import { isProSubscriber, isMaxSubscriber, isTeamSubscriber } from './auth.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from 'src/services/analytics/growthbook.js'
-import { readCustomApiStorage } from './customApiStorage.js'
+import { readCustomApiStorage, getGlobalCompatProvider } from './customApiStorage.js'
 import { getAPIProvider } from './model/providers.js'
 import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { isEnvTruthy } from './envUtils.js'
@@ -22,11 +23,15 @@ export const EFFORT_LEVELS = [
 export type EffortValue = EffortLevel | number
 
 export function isOpenAICompatProvider(): boolean {
-  return readCustomApiStorage().provider === 'openai'
+  const customConfig = getGlobalConfig().customApiEndpoint
+  const provider = readCustomApiStorage().provider || customConfig?.provider || getGlobalCompatProvider(customConfig?.baseURL)
+  return provider === 'openai'
 }
 
 export function isGeminiCompatProvider(): boolean {
-  return readCustomApiStorage().provider === 'gemini'
+  const customConfig = getGlobalConfig().customApiEndpoint
+  const provider = readCustomApiStorage().provider || customConfig?.provider || getGlobalCompatProvider(customConfig?.baseURL)
+  return provider === 'gemini'
 }
 
 export function modelSupportsNoThinking(model: string): boolean {

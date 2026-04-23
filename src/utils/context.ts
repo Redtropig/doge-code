@@ -1,6 +1,7 @@
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import { CONTEXT_1M_BETA_HEADER } from '../constants/betas.js'
 import { getGlobalConfig } from './config.js'
+import { getGlobalCompatProvider } from './customApiStorage.js'
 import { isEnvTruthy } from './envUtils.js'
 import { getCanonicalName } from './model/model.js'
 import { getModelCapability } from './model/modelCapabilities.js'
@@ -64,6 +65,21 @@ export function getContextWindowForModel(
     if (!isNaN(override) && override > 0) {
       return override
     }
+  }
+
+  // Compat providers (openai/gemini) serve arbitrary models whose context
+  // window can't be inferred from the model name — fall through to the 200k
+  // default would silently mis-scale auto-compact. Honor an explicit override
+  // set on customApiEndpoint.contextWindow so users pick the right window.
+  const customConfig = getGlobalConfig().customApiEndpoint
+  const compatContextWindow = customConfig?.contextWindow
+  const compatProvider = customConfig?.provider ?? getGlobalCompatProvider(customConfig?.baseURL)
+  if (
+    (compatProvider === 'openai' || compatProvider === 'gemini') &&
+    typeof compatContextWindow === 'number' &&
+    compatContextWindow > 0
+  ) {
+    return compatContextWindow
   }
 
   // [1m] suffix — explicit client-side opt-in, respected over all detection

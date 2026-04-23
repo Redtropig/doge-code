@@ -188,6 +188,7 @@ export type GlobalConfig = {
     apiKey?: string
     model?: string
     savedModels?: string[]
+    contextWindow?: number
   }
   /**
    * @deprecated Use settings.apiKeyHelper instead.
@@ -599,6 +600,7 @@ function createDefaultGlobalConfig(): GlobalConfig {
       apiKey: undefined,
       model: undefined,
       savedModels: [],
+      contextWindow: undefined,
     },
     numStartups: 0,
     installMethod: undefined,

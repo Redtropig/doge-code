@@ -1,6 +1,6 @@
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import { getGlobalConfig } from '../config.js'
-import { readCustomApiStorage } from '../customApiStorage.js'
+import { readCustomApiStorage, getGlobalCompatProvider } from '../customApiStorage.js'
 import { capitalize } from '../stringUtils.js'
 import { MODEL_ALIASES, type ModelAlias } from './aliases.js'
 import { applyBedrockRegionPrefix, getBedrockRegionPrefix } from './bedrock.js'
@@ -141,10 +141,11 @@ export function getAgentModelOptions(): AgentModelOption[] {
     .map(model => model.trim())
     .filter(Boolean)
 
+  const customConfig = getGlobalConfig().customApiEndpoint
   const customApiProvider =
     readCustomApiStorage().provider ??
-    getGlobalConfig().customApiEndpoint?.provider ??
-    'anthropic'
+    customConfig?.provider ??
+    getGlobalCompatProvider(customConfig?.baseURL)
 
   if (customApiProvider === 'openai' || customApiProvider === 'gemini' || customModels.length > 0) {
     return [

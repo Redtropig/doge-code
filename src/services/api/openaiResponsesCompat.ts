@@ -19,6 +19,11 @@ type OpenAIResponsesInputPart =
   | { type: 'input_image'; image_url: string }
   | { type: 'output_text'; text: string }
 
+type OpenAIResponsesReasoningSummaryPart = {
+  type: 'summary_text'
+  text: string
+}
+
 type OpenAIResponsesInputItem = {
   type: string
   role?: 'system' | 'user' | 'assistant'
@@ -27,6 +32,9 @@ type OpenAIResponsesInputItem = {
   name?: string
   arguments?: string
   output?: string
+  id?: string
+  summary?: OpenAIResponsesReasoningSummaryPart[]
+  encrypted_content?: string
 }
 
 type OpenAIResponsesRequest = {
@@ -46,6 +54,7 @@ type OpenAIResponsesRequest = {
     effort?: 'low' | 'medium' | 'high'
     summary?: 'auto'
   }
+  include?: string[]
 }
 
 type OpenAIResponsesEvent = {
@@ -53,7 +62,15 @@ type OpenAIResponsesEvent = {
   response_id?: string
   item_id?: string
   output_index?: number
-  item?: Record<string, unknown>
+  item?: {
+    type?: string
+    id?: string
+    call_id?: string
+    name?: string
+    arguments?: string
+    encrypted_content?: string
+    [k: string]: unknown
+  }
   delta?: string
   arguments_delta?: string
   summary?: Array<{ text?: string }>
@@ -187,6 +204,7 @@ export function convertAnthropicRequestToOpenAIResponses(input: {
 
     if (message.role === 'user') {
       const toolResults = blocks.filter(block => block.type === 'tool_result')
+      const hoistedImages: OpenAIResponsesInputPart[] = []
       for (const result of toolResults) {
         if (typeof result.tool_use_id !== 'string' || result.tool_use_id.length === 0) {
           throw new Error('[openaiResponsesCompat] tool_result missing tool_use_id — cannot correlate with function_call')
@@ -197,12 +215,21 @@ export function convertAnthropicRequestToOpenAIResponses(input: {
         if (typeof rawContent === 'string') {
           output = rawContent
         } else if (Array.isArray(rawContent)) {
-          output = (rawContent as Array<Record<string, unknown>>)
+          const parts = rawContent as Array<Record<string, unknown>>
+          const imageParts = mapAnthropicUserBlocksToResponsesContent(
+            parts.filter(b => b.type === 'image'),
+          )
+          if (imageParts.length > 0) hoistedImages.push(...imageParts)
+          output = parts
+            .filter(b => b.type !== 'image')
             .map(b => {
               if (b.type === 'text' && typeof b.text === 'string') return b.text
               return JSON.stringify(b)
             })
             .join('\n')
+          if (imageParts.length > 0 && !output) {
+            output = `[tool returned ${imageParts.length} image${imageParts.length === 1 ? '' : 's'}; see next user message]`
+          }
         } else {
           output = JSON.stringify(rawContent ?? '')
         }
@@ -217,14 +244,43 @@ export function convertAnthropicRequestToOpenAIResponses(input: {
       const userContent = mapAnthropicUserBlocksToResponsesContent(
         blocks.filter(block => block.type !== 'tool_result') as Array<Record<string, unknown>>,
       )
-      if (userContent.length > 0) {
+      const combinedUserContent = [...hoistedImages, ...userContent]
+      if (combinedUserContent.length > 0) {
         items.push({
           type: 'message',
           role: 'user',
-          content: userContent,
+          content: combinedUserContent,
         })
       }
       continue
+    }
+
+    for (const block of blocks) {
+      if (block.type !== 'thinking') continue
+      const signature = typeof block.signature === 'string' ? block.signature : ''
+      if (!signature) continue
+      let parsed: { id?: unknown; encrypted_content?: unknown } | undefined
+      try {
+        parsed = JSON.parse(signature)
+      } catch {
+        continue
+      }
+      if (
+        !parsed ||
+        typeof parsed.id !== 'string' ||
+        typeof parsed.encrypted_content !== 'string'
+      ) {
+        continue
+      }
+      const summaryText = typeof block.thinking === 'string' ? block.thinking : ''
+      items.push({
+        type: 'reasoning',
+        id: parsed.id,
+        summary: summaryText
+          ? [{ type: 'summary_text', text: summaryText }]
+          : [],
+        encrypted_content: parsed.encrypted_content,
+      })
     }
 
     const text = blocks
@@ -281,6 +337,7 @@ export function convertAnthropicRequestToOpenAIResponses(input: {
           reasoning:
             mapEffortToResponsesReasoning(input.effort) ??
             { effort: 'medium' as const, summary: 'auto' as const },
+          include: ['reasoning.encrypted_content'],
         }
       : {}),
   }
@@ -399,6 +456,8 @@ export async function* createAnthropicStreamFromOpenAIResponses(input: {
   let stopReason: BetaMessage['stop_reason'] = 'end_turn'
   const toolStateById = new Map<string, ToolState>()
   const toolIdsInOrder: string[] = []
+  let currentReasoningItemId: string | undefined
+  let currentReasoningItemEncrypted: string | undefined
 
   while (true) {
     const { done, value } = await input.reader.read()
@@ -458,6 +517,51 @@ export async function* createAnthropicStreamFromOpenAIResponses(input: {
         const eventType = event.type ?? ''
         const thinkingDelta = getEventThinkingDelta(event)
         const textDelta = getEventTextDelta(event)
+
+        if (eventType === 'response.output_item.added') {
+          const addedItem = event.item
+          if (addedItem?.type === 'reasoning' && typeof addedItem.id === 'string') {
+            currentReasoningItemId = addedItem.id
+            currentReasoningItemEncrypted = undefined
+          }
+        }
+
+        if (eventType === 'response.output_item.done') {
+          const doneItem = event.item
+          if (doneItem?.type === 'reasoning') {
+            if (typeof doneItem.encrypted_content === 'string') {
+              currentReasoningItemEncrypted = doneItem.encrypted_content
+            }
+            if (currentReasoningItemId && currentReasoningItemEncrypted) {
+              if (currentTextIndex !== null) {
+                yield { type: 'content_block_stop', index: currentTextIndex } as BetaRawMessageStreamEvent
+                currentTextIndex = null
+              }
+              if (currentThinkingIndex === null) {
+                currentThinkingIndex = nextContentIndex++
+                yield {
+                  type: 'content_block_start',
+                  index: currentThinkingIndex,
+                  content_block: { type: 'thinking', thinking: '', signature: '' },
+                } as BetaRawMessageStreamEvent
+                emittedAnyContent = true
+              }
+              const signature = JSON.stringify({
+                id: currentReasoningItemId,
+                encrypted_content: currentReasoningItemEncrypted,
+              })
+              yield {
+                type: 'content_block_delta',
+                index: currentThinkingIndex,
+                delta: { type: 'signature_delta', signature },
+              } as BetaRawMessageStreamEvent
+              yield { type: 'content_block_stop', index: currentThinkingIndex } as BetaRawMessageStreamEvent
+              currentThinkingIndex = null
+            }
+            currentReasoningItemId = undefined
+            currentReasoningItemEncrypted = undefined
+          }
+        }
 
         if (thinkingDelta && eventType.includes('reasoning')) {
           if (currentTextIndex !== null) {
@@ -595,7 +699,12 @@ export async function* createAnthropicStreamFromOpenAIResponses(input: {
   yield {
     type: 'message_delta',
     delta: { stop_reason: stopReason, stop_sequence: null },
-    usage: { output_tokens: completionTokens },
+    usage: {
+      input_tokens: promptTokens,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      output_tokens: completionTokens,
+    },
   } as BetaRawMessageStreamEvent
 
   yield { type: 'message_stop' } as BetaRawMessageStreamEvent

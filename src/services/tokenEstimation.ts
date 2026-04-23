@@ -7,6 +7,8 @@ import { getAPIProvider } from 'src/utils/model/providers.js'
 import { VERTEX_COUNT_TOKENS_ALLOWED_BETAS } from '../constants/betas.js'
 import type { Attachment } from '../utils/attachments.js'
 import { getModelBetas } from '../utils/betas.js'
+import { getGlobalConfig } from '../utils/config.js'
+import { getGlobalCompatProvider } from '../utils/customApiStorage.js'
 import { getVertexRegionForModel, isEnvTruthy } from '../utils/envUtils.js'
 import { logError } from '../utils/log.js'
 import { normalizeAttachmentForAPI } from '../utils/messages.js'
@@ -31,6 +33,15 @@ import { withTokenCountVCR } from './vcr.js'
 // API constraint: max_tokens must be greater than thinking.budget_tokens
 const TOKEN_COUNT_THINKING_BUDGET = 1024
 const TOKEN_COUNT_MAX_TOKENS = 2048
+
+// Compat providers (openai/gemini) don't implement Anthropic's /count_tokens
+// or accept /messages with Anthropic semantics. Skip the round-trip and let
+// callers fall back to rough estimation.
+function isCompatProvider(): boolean {
+  const customConfig = getGlobalConfig().customApiEndpoint
+  const provider = customConfig?.provider ?? getGlobalCompatProvider(customConfig?.baseURL)
+  return provider === 'openai' || provider === 'gemini'
+}
 
 /**
  * Check if messages contain thinking blocks
@@ -141,6 +152,7 @@ export async function countMessagesTokensWithAPI(
   messages: Anthropic.Beta.Messages.BetaMessageParam[],
   tools: Anthropic.Beta.Messages.BetaToolUnion[],
 ): Promise<number | null> {
+  if (isCompatProvider()) return null
   return withTokenCountVCR(messages, tools, async () => {
     try {
       const model = getMainLoopModel()
@@ -252,6 +264,7 @@ export async function countTokensViaHaikuFallback(
   messages: Anthropic.Beta.Messages.BetaMessageParam[],
   tools: Anthropic.Beta.Messages.BetaToolUnion[],
 ): Promise<number | null> {
+  if (isCompatProvider()) return null
   // Check if messages contain thinking blocks
   const containsThinking = hasThinkingBlocks(messages)
 

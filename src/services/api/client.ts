@@ -1,4 +1,5 @@
 import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk'
+import { getGlobalConfig } from 'src/utils/config.js'
 import { randomUUID } from 'crypto'
 import type { GoogleAuth } from 'google-auth-library'
 import {
@@ -16,7 +17,7 @@ import {
   getAPIProvider,
   isFirstPartyAnthropicBaseUrl,
 } from 'src/utils/model/providers.js'
-import { readCustomApiStorage } from 'src/utils/customApiStorage.js'
+import { readCustomApiStorage, getGlobalCompatProvider } from 'src/utils/customApiStorage.js'
 import { getProxyFetchOptions } from 'src/utils/proxy.js'
 import {
   getIsNonInteractiveSession,
@@ -99,8 +100,9 @@ export async function getAnthropicClient({
   fetchOverride?: ClientOptions['fetch']
   source?: string
 }): Promise<Anthropic> {
+  const customApiConfig = getGlobalConfig().customApiEndpoint
   const customApiProvider =
-    readCustomApiStorage().provider ?? getGlobalCompatProvider()
+    readCustomApiStorage().provider ?? customApiConfig?.provider ?? getGlobalCompatProvider(customApiConfig?.baseURL)
   const containerId = process.env.CLAUDE_CODE_CONTAINER_ID
   const remoteSessionId = process.env.CLAUDE_CODE_REMOTE_SESSION_ID
   const clientApp = process.env.CLAUDE_AGENT_SDK_CLIENT_APP
@@ -322,14 +324,6 @@ export async function getAnthropicClient({
   }
 
   return new Anthropic(clientConfig)
-}
-
-function getGlobalCompatProvider(): 'anthropic' | 'openai' | 'gemini' {
-  return process.env.CLAUDE_CODE_COMPATIBLE_API_PROVIDER === 'openai'
-    ? 'openai'
-    : process.env.CLAUDE_CODE_COMPATIBLE_API_PROVIDER === 'gemini'
-      ? 'gemini'
-      : 'anthropic'
 }
 
 async function configureApiKeyHeaders(

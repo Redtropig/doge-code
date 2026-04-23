@@ -24,7 +24,7 @@ import {
   getAPIProvider,
   isFirstPartyAnthropicBaseUrl,
 } from 'src/utils/model/providers.js'
-import { readCustomApiStorage } from 'src/utils/customApiStorage.js'
+import { readCustomApiStorage, getGlobalCompatProvider } from 'src/utils/customApiStorage.js'
 import { createProxyAwareFetch } from 'src/utils/proxy.js'
 import {
   convertAnthropicRequestToGemini,
@@ -1826,7 +1826,8 @@ async function* queryModel(
           ...(getGlobalConfig().customApiEndpoint ?? {}),
           ...readCustomApiStorage(),
         }
-        const compatProvider = customApiConfig.provider ?? 'anthropic'
+        const customBaseURL = customApiConfig.baseURL || process.env.ANTHROPIC_BASE_URL || ''
+        const compatProvider = customApiConfig.provider ?? getGlobalCompatProvider(customBaseURL)
         const openAICompatMode = customApiConfig.openaiCompatMode ?? 'chat_completions'
         if (compatProvider === 'gemini') {
           const geminiRequest = convertAnthropicRequestToGemini({

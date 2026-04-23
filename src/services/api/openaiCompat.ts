@@ -204,6 +204,7 @@ export function convertAnthropicRequestToOpenAI(input: {
       const blocks = toBlocks(message.content)
 
       const toolResults = blocks.filter(block => block.type === 'tool_result')
+      const hoistedImages: OpenAIChatContentPart[] = []
       for (const result of toolResults) {
         if (typeof result.tool_use_id !== 'string' || result.tool_use_id.length === 0) {
           throw new Error('[openaiCompat] tool_result missing tool_use_id — cannot correlate with tool_call')
@@ -214,12 +215,21 @@ export function convertAnthropicRequestToOpenAI(input: {
         if (typeof rawContent === 'string') {
           textContent = rawContent
         } else if (Array.isArray(rawContent)) {
-          textContent = (rawContent as AnyBlock[])
+          const parts = rawContent as AnyBlock[]
+          const imageParts = mapAnthropicUserBlocksToOpenAIContent(
+            parts.filter(b => b.type === 'image'),
+          )
+          if (imageParts.length > 0) hoistedImages.push(...imageParts)
+          textContent = parts
+            .filter(b => b.type !== 'image')
             .map(b => {
               if (b.type === 'text' && typeof b.text === 'string') return b.text
               return JSON.stringify(b)
             })
             .join('\n')
+          if (imageParts.length > 0 && !textContent) {
+            textContent = `[tool returned ${imageParts.length} image${imageParts.length === 1 ? '' : 's'}; see next user message]`
+          }
         } else {
           textContent = JSON.stringify(rawContent ?? '')
         }
@@ -234,7 +244,10 @@ export function convertAnthropicRequestToOpenAI(input: {
       const userContent = mapAnthropicUserBlocksToOpenAIContent(
         blocks.filter(block => block.type !== 'tool_result') as AnyBlock[],
       )
-      if (userContent.length > 0) messages.push({ role: 'user', content: userContent })
+      const combinedUserContent = [...hoistedImages, ...userContent]
+      if (combinedUserContent.length > 0) {
+        messages.push({ role: 'user', content: combinedUserContent })
+      }
       continue
     }
 
@@ -319,7 +332,11 @@ export async function createOpenAICompatStream(
         authorization: `Bearer ${config.apiKey}`,
         ...config.headers,
       },
-      body: JSON.stringify({ ...request, stream: true }),
+      body: JSON.stringify({
+        ...request,
+        stream: true,
+        stream_options: { include_usage: true },
+      }),
     },
   )
 
@@ -564,7 +581,12 @@ export async function* createAnthropicStreamFromOpenAI(input: {
   yield {
     type: 'message_delta',
     delta: { stop_reason: stopReason, stop_sequence: null },
-    usage: { output_tokens: completionTokens },
+    usage: {
+      input_tokens: promptTokens,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      output_tokens: completionTokens,
+    },
   } as BetaRawMessageStreamEvent
 
   yield { type: 'message_stop' } as BetaRawMessageStreamEvent

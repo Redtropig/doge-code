@@ -226,15 +226,24 @@ export function convertAnthropicRequestToGemini(input: {
           }
           const rawContent = block.content
           let textContent: string
+          const toolImageParts: GeminiPart[] = []
           if (typeof rawContent === 'string') {
             textContent = rawContent
           } else if (Array.isArray(rawContent)) {
-            textContent = (rawContent as AnyBlock[])
+            const rawParts = rawContent as AnyBlock[]
+            toolImageParts.push(
+              ...mapAnthropicUserBlocksToGeminiParts(rawParts.filter(b => b.type === 'image')),
+            )
+            textContent = rawParts
+              .filter(b => b.type !== 'image')
               .map(b => {
                 if (b.type === 'text' && typeof b.text === 'string') return b.text
                 return JSON.stringify(b)
               })
               .join('\n')
+            if (toolImageParts.length > 0 && !textContent) {
+              textContent = `[tool returned ${toolImageParts.length} image${toolImageParts.length === 1 ? '' : 's'}; see attached parts]`
+            }
           } else {
             textContent = JSON.stringify(rawContent ?? '')
           }
@@ -245,6 +254,7 @@ export function convertAnthropicRequestToGemini(input: {
               response: { content: textContent },
             },
           })
+          parts.push(...toolImageParts)
         }
       }
 
@@ -268,6 +278,18 @@ export function convertAnthropicRequestToGemini(input: {
     for (const block of assistantBlocks) {
       if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
         parts.push({ text: block.text })
+        continue
+      }
+
+      if (block.type === 'thinking') {
+        const signature = typeof block.signature === 'string' ? block.signature : ''
+        const thinkingText = typeof block.thinking === 'string' ? block.thinking : ''
+        if (!signature) continue
+        parts.push({
+          thought: true,
+          ...(thinkingText ? { text: thinkingText } : {}),
+          thoughtSignature: signature,
+        })
         continue
       }
 
@@ -618,7 +640,12 @@ export async function* createAnthropicStreamFromGemini(input: {
   yield {
     type: 'message_delta',
     delta: { stop_reason: stopReason, stop_sequence: null },
-    usage: { output_tokens: completionTokens },
+    usage: {
+      input_tokens: promptTokens,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      output_tokens: completionTokens,
+    },
   } as BetaRawMessageStreamEvent
 
   yield { type: 'message_stop' } as BetaRawMessageStreamEvent
