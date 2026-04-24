@@ -1,3 +1,4 @@
+import { APIConnectionError, APIError } from '@anthropic-ai/sdk'
 import type {
   BetaMessage,
   BetaMessageParam,
@@ -317,28 +318,63 @@ export function convertAnthropicRequestToOpenAI(input: {
   }
 }
 
+// Convert a non-2xx HTTP response into an Anthropic SDK APIError subtype so
+// withRetry's shouldRetry() treats 5xx/408/409/429 as retryable instead of
+// bailing on the raw Error (which has no .status to inspect).
+function wrapOpenAICompatHttpError(
+  status: number,
+  responseText: string,
+  responseHeaders: Headers,
+): APIError {
+  const body = {
+    error: {
+      type: 'openai_compat_error',
+      message: responseText ? responseText.slice(0, 2000) : undefined,
+    },
+  }
+  const message = `OpenAI compatible request failed with status ${status}${responseText ? `: ${responseText}` : ''}`
+  return APIError.generate(status, body, message, responseHeaders)
+}
+
+// Convert a raw fetch/reader failure (socket closed, DNS fail, TLS reset, etc.)
+// into APIConnectionError. withRetry.shouldRetry() has an explicit
+// `error instanceof APIConnectionError` branch that returns true.
+// AbortError must pass through unchanged so upstream treats it as user abort.
+function throwAsConnectionError(err: unknown): never {
+  if (err instanceof Error && err.name === 'AbortError') throw err
+  throw new APIConnectionError({
+    message: err instanceof Error ? err.message : String(err),
+    cause: err instanceof Error ? err : undefined,
+  })
+}
+
 export async function createOpenAICompatStream(
   config: OpenAICompatConfig,
   request: OpenAIChatRequest,
   signal?: AbortSignal,
 ): Promise<ReadableStreamDefaultReader<Uint8Array>> {
-  const response = await (config.fetch ?? globalThis.fetch)(
-    joinBaseUrl(config.baseURL, '/chat/completions'),
-    {
-      method: 'POST',
-      signal,
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${config.apiKey}`,
-        ...config.headers,
+  let response: Response
+  try {
+    response = await (config.fetch ?? globalThis.fetch)(
+      joinBaseUrl(config.baseURL, '/chat/completions'),
+      {
+        method: 'POST',
+        signal,
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${config.apiKey}`,
+          ...config.headers,
+        },
+        body: JSON.stringify({
+          ...request,
+          stream: true,
+          stream_options: { include_usage: true },
+        }),
       },
-      body: JSON.stringify({
-        ...request,
-        stream: true,
-        stream_options: { include_usage: true },
-      }),
-    },
-  )
+    )
+  } catch (err) {
+    throwAsConnectionError(err)
+  }
 
   if (!response.ok || !response.body) {
     let responseText = ''
@@ -347,8 +383,10 @@ export async function createOpenAICompatStream(
     } catch {
       responseText = ''
     }
-    throw new Error(
-      `OpenAI compatible request failed with status ${response.status}${responseText ? `: ${responseText}` : ''}`,
+    throw wrapOpenAICompatHttpError(
+      response.status,
+      responseText,
+      response.headers,
     )
   }
 
@@ -401,7 +439,13 @@ export async function* createAnthropicStreamFromOpenAI(input: {
   const toolCallOrder: number[] = []
 
   while (true) {
-    const { done, value } = await input.reader.read()
+    let readResult: Awaited<ReturnType<typeof input.reader.read>>
+    try {
+      readResult = await input.reader.read()
+    } catch (err) {
+      throwAsConnectionError(err)
+    }
+    const { done, value } = readResult
     if (done) break
     buffer += decoder.decode(value, { stream: true })
     const parsed = parseSSEChunk(buffer)
@@ -645,25 +689,32 @@ export async function requestOpenAICompatNonStream(
   request: OpenAIChatRequest,
   signal?: AbortSignal,
 ): Promise<OpenAIChatCompletionResponse> {
-  const response = await (config.fetch ?? globalThis.fetch)(
-    joinBaseUrl(config.baseURL, '/chat/completions'),
-    {
-      method: 'POST',
-      signal,
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${config.apiKey}`,
-        ...config.headers,
+  let response: Response
+  try {
+    response = await (config.fetch ?? globalThis.fetch)(
+      joinBaseUrl(config.baseURL, '/chat/completions'),
+      {
+        method: 'POST',
+        signal,
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${config.apiKey}`,
+          ...config.headers,
+        },
+        body: JSON.stringify({ ...request, stream: false }),
       },
-      body: JSON.stringify({ ...request, stream: false }),
-    },
-  )
+    )
+  } catch (err) {
+    throwAsConnectionError(err)
+  }
 
   const responseText = await response.text().catch(() => '')
 
   if (!response.ok) {
-    throw new Error(
-      `OpenAI compatible request failed with status ${response.status}${responseText ? `: ${responseText}` : ''}`,
+    throw wrapOpenAICompatHttpError(
+      response.status,
+      responseText,
+      response.headers,
     )
   }
 
