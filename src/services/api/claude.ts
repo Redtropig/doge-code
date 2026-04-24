@@ -29,17 +29,23 @@ import { createProxyAwareFetch } from 'src/utils/proxy.js'
 import {
   convertAnthropicRequestToGemini,
   createAnthropicStreamFromGemini,
+  createBetaMessageFromGeminiResponse,
   createGeminiCompatStream,
+  requestGeminiCompatNonStream,
 } from './geminiCompat.js'
 import {
   convertAnthropicRequestToOpenAI,
   createAnthropicStreamFromOpenAI,
+  createBetaMessageFromOpenAIResponse,
   createOpenAICompatStream,
+  requestOpenAICompatNonStream,
 } from './openaiCompat.js'
 import {
   convertAnthropicRequestToOpenAIResponses,
   createAnthropicStreamFromOpenAIResponses,
+  createBetaMessageFromOpenAIResponsesResponse,
   createOpenAIResponsesStream,
+  requestOpenAIResponsesNonStream,
 } from './openaiResponsesCompat.js'
 import {
   getAttributionHeader,
@@ -823,6 +829,7 @@ export async function* executeNonStreamingRequest(
     model: string
     fetchOverride?: Options['fetchOverride']
     source: string
+    effort?: EffortValue
   },
   retryOptions: {
     model: string
@@ -863,6 +870,103 @@ export async function* executeNonStreamingRequest(
       )
 
       try {
+        const customApiConfig = {
+          ...(getGlobalConfig().customApiEndpoint ?? {}),
+          ...readCustomApiStorage(),
+        }
+        const customBaseURL =
+          customApiConfig.baseURL || process.env.ANTHROPIC_BASE_URL || ''
+        const compatProvider =
+          customApiConfig.provider ?? getGlobalCompatProvider(customBaseURL)
+        const openAICompatMode = customApiConfig.openaiCompatMode ?? 'chat_completions'
+
+        if (compatProvider === 'openai' || compatProvider === 'gemini') {
+          const compatConfig = {
+            apiKey: customApiConfig.apiKey || process.env.DOGE_API_KEY || '',
+            baseURL:
+              customApiConfig.baseURL || process.env.ANTHROPIC_BASE_URL || '',
+            fetch: createProxyAwareFetch(),
+          }
+          const timeoutController = new AbortController()
+          const timeoutId = setTimeout(
+            () => timeoutController.abort(),
+            fallbackTimeoutMs,
+          )
+          const onAbort = () => timeoutController.abort()
+          retryOptions.signal.addEventListener('abort', onAbort, { once: true })
+          try {
+            if (compatProvider === 'gemini') {
+              const geminiRequest = convertAnthropicRequestToGemini({
+                model: adjustedParams.model,
+                system: adjustedParams.system,
+                messages: adjustedParams.messages,
+                tools: adjustedParams.tools,
+                tool_choice: adjustedParams.tool_choice,
+                temperature: adjustedParams.temperature,
+                max_tokens: adjustedParams.max_tokens,
+                thinking: adjustedParams.thinking,
+                effort: clientOptions.effort,
+              })
+              const geminiResponse = await requestGeminiCompatNonStream(
+                compatConfig,
+                process.env.ANTHROPIC_MODEL?.trim() || adjustedParams.model,
+                geminiRequest,
+                timeoutController.signal,
+              )
+              return createBetaMessageFromGeminiResponse({
+                response: geminiResponse,
+                model: adjustedParams.model,
+              })
+            }
+
+            if (openAICompatMode === 'responses') {
+              const responsesRequest = convertAnthropicRequestToOpenAIResponses({
+                model: adjustedParams.model,
+                system: adjustedParams.system,
+                messages: adjustedParams.messages,
+                tools: adjustedParams.tools,
+                tool_choice: adjustedParams.tool_choice,
+                temperature: adjustedParams.temperature,
+                max_tokens: adjustedParams.max_tokens,
+                thinking: adjustedParams.thinking,
+                effort: clientOptions.effort,
+              })
+              const responsesResponse = await requestOpenAIResponsesNonStream(
+                compatConfig,
+                responsesRequest,
+                timeoutController.signal,
+              )
+              return createBetaMessageFromOpenAIResponsesResponse({
+                response: responsesResponse,
+                model: adjustedParams.model,
+              })
+            }
+
+            const openAIRequest = convertAnthropicRequestToOpenAI({
+              model: adjustedParams.model,
+              system: adjustedParams.system,
+              messages: adjustedParams.messages,
+              tools: adjustedParams.tools,
+              tool_choice: adjustedParams.tool_choice,
+              temperature: adjustedParams.temperature,
+              max_tokens: adjustedParams.max_tokens,
+              thinking: adjustedParams.thinking,
+            })
+            const openAIResponse = await requestOpenAICompatNonStream(
+              compatConfig,
+              openAIRequest,
+              timeoutController.signal,
+            )
+            return createBetaMessageFromOpenAIResponse({
+              response: openAIResponse,
+              model: adjustedParams.model,
+            })
+          } finally {
+            clearTimeout(timeoutId)
+            retryOptions.signal.removeEventListener('abort', onAbort)
+          }
+        }
+
         // biome-ignore lint/plugin: non-streaming API call
         return await anthropic.beta.messages.create(
           {
@@ -2679,7 +2783,7 @@ async function* queryModel(
           : 'other') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       })
       const result = yield* executeNonStreamingRequest(
-        { model: options.model, source: options.querySource },
+        { model: options.model, source: options.querySource, effort },
         {
           model: options.model,
           fallbackModel: options.fallbackModel,
@@ -2778,7 +2882,7 @@ async function* queryModel(
       try {
         // Fall back to non-streaming mode
         const result = yield* executeNonStreamingRequest(
-          { model: options.model, source: options.querySource },
+          { model: options.model, source: options.querySource, effort },
           {
             model: options.model,
             fallbackModel: options.fallbackModel,

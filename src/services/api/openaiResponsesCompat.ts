@@ -723,3 +723,159 @@ export async function* createAnthropicStreamFromOpenAIResponses(input: {
     },
   } as BetaMessage
 }
+
+type OpenAIResponsesOutputItem = {
+  type?: string
+  id?: string
+  role?: string
+  call_id?: string
+  name?: string
+  arguments?: string
+  content?: Array<{
+    type?: string
+    text?: string
+  }>
+  summary?: Array<{ text?: string }>
+}
+
+type OpenAIResponsesNonStreamingResponse = {
+  id?: string
+  status?: string
+  output?: OpenAIResponsesOutputItem[]
+  usage?: {
+    input_tokens?: number
+    output_tokens?: number
+  }
+  incomplete_details?: { reason?: string } | null
+  error?: { message?: string; code?: string; type?: string }
+}
+
+export async function requestOpenAIResponsesNonStream(
+  config: OpenAICompatConfig,
+  request: OpenAIResponsesRequest,
+  signal?: AbortSignal,
+): Promise<OpenAIResponsesNonStreamingResponse> {
+  const response = await (config.fetch ?? globalThis.fetch)(
+    joinBaseUrl(config.baseURL, '/responses'),
+    {
+      method: 'POST',
+      signal,
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${config.apiKey}`,
+        ...config.headers,
+      },
+      body: JSON.stringify({ ...request, stream: false }),
+    },
+  )
+
+  const responseText = await response.text().catch(() => '')
+
+  if (!response.ok) {
+    throw new Error(
+      `OpenAI Responses compatible request failed with status ${response.status}${responseText ? `: ${responseText}` : ''}`,
+    )
+  }
+
+  let parsed: OpenAIResponsesNonStreamingResponse
+  try {
+    parsed = JSON.parse(responseText) as OpenAIResponsesNonStreamingResponse
+  } catch {
+    throw new Error(
+      `OpenAI Responses endpoint returned non-JSON response: ${responseText.slice(0, 500)}`,
+    )
+  }
+
+  if (parsed.error) {
+    const msg =
+      parsed.error.message ||
+      parsed.error.type ||
+      JSON.stringify(parsed.error).slice(0, 500)
+    throw new Error(`[openaiResponsesCompat] non-streaming error: ${msg}`)
+  }
+
+  return parsed
+}
+
+export function createBetaMessageFromOpenAIResponsesResponse(input: {
+  response: OpenAIResponsesNonStreamingResponse
+  model: string
+}): BetaMessage {
+  type AnyBlock = Record<string, unknown>
+  const content: AnyBlock[] = []
+  let hasToolCall = false
+
+  for (const item of input.response.output ?? []) {
+    if (item.type === 'reasoning') {
+      const thinkingText = (item.summary ?? [])
+        .map(part => (typeof part?.text === 'string' ? part.text : ''))
+        .join('')
+      if (thinkingText.length > 0) {
+        content.push({ type: 'thinking', thinking: thinkingText, signature: '' })
+      }
+      continue
+    }
+
+    if (item.type === 'message') {
+      const text = (item.content ?? [])
+        .filter(part => part?.type === 'output_text')
+        .map(part => (typeof part?.text === 'string' ? part.text : ''))
+        .join('')
+      if (text.length > 0) {
+        content.push({ type: 'text', text })
+      }
+      continue
+    }
+
+    if (item.type === 'function_call') {
+      if (!item.name) {
+        throw new Error('[openaiResponsesCompat] non-streaming function_call missing name')
+      }
+      const rawArgs = item.arguments ?? ''
+      let parsedArgs: unknown = {}
+      if (rawArgs.length > 0) {
+        try {
+          parsedArgs = JSON.parse(rawArgs)
+        } catch {
+          throw new Error(
+            `[openaiResponsesCompat] non-streaming function_call arguments invalid JSON for tool=${item.name}`,
+          )
+        }
+      }
+      content.push({
+        type: 'tool_use',
+        id: item.call_id ?? item.id ?? `toolu_openai_responses_${content.length}`,
+        name: item.name,
+        input: parsedArgs,
+      })
+      hasToolCall = true
+    }
+  }
+
+  if (content.length === 0) {
+    content.push({ type: 'text', text: '' })
+  }
+
+  let stopReason: BetaMessage['stop_reason'] = 'end_turn'
+  if (input.response.incomplete_details?.reason === 'max_output_tokens') {
+    stopReason = 'max_tokens'
+  } else if (hasToolCall) {
+    stopReason = 'tool_use'
+  }
+
+  return {
+    id: input.response.id ?? 'openai-responses-compat',
+    type: 'message',
+    role: 'assistant',
+    model: input.model,
+    content: content as unknown as BetaMessage['content'],
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: input.response.usage?.input_tokens ?? 0,
+      output_tokens: input.response.usage?.output_tokens ?? 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    },
+  } as BetaMessage
+}

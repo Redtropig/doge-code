@@ -618,3 +618,142 @@ export function mapOpenAIUsageToAnthropic(usage?: {
     cache_read_input_tokens: 0,
   } as BetaUsage
 }
+
+type OpenAIChatCompletionResponse = {
+  id?: string
+  model?: string
+  choices?: Array<{
+    index?: number
+    message?: {
+      role?: 'assistant'
+      content?: string | null
+      reasoning_content?: string | null
+      tool_calls?: OpenAIToolCall[]
+    }
+    finish_reason?: string | null
+  }>
+  usage?: {
+    prompt_tokens?: number
+    completion_tokens?: number
+    total_tokens?: number
+  }
+  error?: { message?: string; code?: string | number; type?: string }
+}
+
+export async function requestOpenAICompatNonStream(
+  config: OpenAICompatConfig,
+  request: OpenAIChatRequest,
+  signal?: AbortSignal,
+): Promise<OpenAIChatCompletionResponse> {
+  const response = await (config.fetch ?? globalThis.fetch)(
+    joinBaseUrl(config.baseURL, '/chat/completions'),
+    {
+      method: 'POST',
+      signal,
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${config.apiKey}`,
+        ...config.headers,
+      },
+      body: JSON.stringify({ ...request, stream: false }),
+    },
+  )
+
+  const responseText = await response.text().catch(() => '')
+
+  if (!response.ok) {
+    throw new Error(
+      `OpenAI compatible request failed with status ${response.status}${responseText ? `: ${responseText}` : ''}`,
+    )
+  }
+
+  let parsed: OpenAIChatCompletionResponse
+  try {
+    parsed = JSON.parse(responseText) as OpenAIChatCompletionResponse
+  } catch {
+    throw new Error(
+      `OpenAI compatible endpoint returned non-JSON response: ${responseText.slice(0, 500)}`,
+    )
+  }
+
+  if (parsed.error) {
+    const msg =
+      parsed.error.message ||
+      parsed.error.type ||
+      JSON.stringify(parsed.error).slice(0, 500)
+    throw new Error(`[openaiCompat] non-streaming error: ${msg}`)
+  }
+
+  return parsed
+}
+
+export function createBetaMessageFromOpenAIResponse(input: {
+  response: OpenAIChatCompletionResponse
+  model: string
+}): BetaMessage {
+  const choice = input.response.choices?.[0]
+  const message = choice?.message
+  const content: AnyBlock[] = []
+
+  const reasoningText =
+    typeof message?.reasoning_content === 'string' ? message.reasoning_content : ''
+  if (reasoningText.length > 0) {
+    content.push({ type: 'thinking', thinking: reasoningText, signature: '' })
+  }
+
+  const text = typeof message?.content === 'string' ? message.content : ''
+  if (text.length > 0) {
+    content.push({ type: 'text', text })
+  }
+
+  const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : []
+  for (const [idx, toolCall] of toolCalls.entries()) {
+    if (!toolCall?.function?.name) {
+      throw new Error(
+        `[openaiCompat] non-streaming tool_call at index ${idx} missing function.name`,
+      )
+    }
+    const rawArgs = toolCall.function.arguments ?? ''
+    let parsedArgs: unknown = {}
+    if (rawArgs.length > 0) {
+      try {
+        parsedArgs = JSON.parse(rawArgs)
+      } catch {
+        throw new Error(
+          `[openaiCompat] non-streaming tool_call arguments are not valid JSON for tool=${toolCall.function.name}`,
+        )
+      }
+    }
+    content.push({
+      type: 'tool_use',
+      id: toolCall.id ?? `toolu_openai_${idx}`,
+      name: toolCall.function.name,
+      input: parsedArgs,
+    })
+  }
+
+  if (content.length === 0) {
+    content.push({ type: 'text', text: '' })
+  }
+
+  let stopReason: BetaMessage['stop_reason'] = mapFinishReason(choice?.finish_reason)
+  if (toolCalls.length > 0 && stopReason !== 'max_tokens') {
+    stopReason = 'tool_use'
+  }
+
+  return {
+    id: input.response.id ?? 'openai-compat',
+    type: 'message',
+    role: 'assistant',
+    model: input.model,
+    content: content as unknown as BetaMessage['content'],
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: input.response.usage?.prompt_tokens ?? 0,
+      output_tokens: input.response.usage?.completion_tokens ?? 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    },
+  } as BetaMessage
+}

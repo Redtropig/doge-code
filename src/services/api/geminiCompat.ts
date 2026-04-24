@@ -664,3 +664,164 @@ export async function* createAnthropicStreamFromGemini(input: {
     },
   } as BetaMessage
 }
+
+type GeminiNonStreamingResponse = {
+  candidates?: Array<{
+    content?: {
+      parts?: GeminiPart[]
+    }
+    finishReason?: string
+  }>
+  usageMetadata?: {
+    promptTokenCount?: number
+    candidatesTokenCount?: number
+    totalTokenCount?: number
+  }
+  promptFeedback?: {
+    blockReason?: string
+    blockReasonMessage?: string
+  }
+  error?: { code?: number; message?: string; status?: string }
+}
+
+export async function requestGeminiCompatNonStream(
+  config: OpenAICompatConfig,
+  model: string,
+  request: GeminiRequest,
+  signal?: AbortSignal,
+): Promise<GeminiNonStreamingResponse> {
+  const response = await (config.fetch ?? globalThis.fetch)(
+    joinBaseUrl(config.baseURL, `/models/${encodeURIComponent(model)}:generateContent`),
+    {
+      method: 'POST',
+      signal,
+      headers: {
+        'content-type': 'application/json',
+        'x-goog-api-key': config.apiKey,
+        ...config.headers,
+      },
+      body: JSON.stringify(request),
+    },
+  )
+
+  const responseText = await response.text().catch(() => '')
+
+  if (!response.ok) {
+    throw new Error(
+      `Gemini request failed with status ${response.status}${responseText ? `: ${responseText}` : ''}`,
+    )
+  }
+
+  let parsed: GeminiNonStreamingResponse
+  try {
+    parsed = JSON.parse(responseText) as GeminiNonStreamingResponse
+  } catch {
+    throw new Error(
+      `Gemini endpoint returned non-JSON response: ${responseText.slice(0, 500)}`,
+    )
+  }
+
+  if (parsed.error) {
+    const msg = parsed.error.message || parsed.error.status || JSON.stringify(parsed.error)
+    throw new Error(`[geminiCompat] non-streaming error: ${msg}`)
+  }
+
+  if (parsed.promptFeedback?.blockReason) {
+    const reason = parsed.promptFeedback.blockReason
+    const detail = parsed.promptFeedback.blockReasonMessage
+    throw new Error(
+      `[geminiCompat] prompt blocked: ${reason}${detail ? ` — ${detail}` : ''}`,
+    )
+  }
+
+  return parsed
+}
+
+export function createBetaMessageFromGeminiResponse(input: {
+  response: GeminiNonStreamingResponse
+  model: string
+}): BetaMessage {
+  const candidate = input.response.candidates?.[0]
+  const parts = candidate?.content?.parts ?? []
+  const content: AnyBlock[] = []
+
+  let thinkingAccum = ''
+  let thinkingSignature = ''
+  let textAccum = ''
+  let toolCounter = 0
+  const toolCalls: Array<{ id: string; name: string; args: unknown }> = []
+
+  for (const part of parts) {
+    const isThought = part.thought === true
+    const hasText = typeof part.text === 'string' && part.text.length > 0
+
+    if (hasText && isThought) {
+      thinkingAccum += part.text
+      if (typeof part.thoughtSignature === 'string' && part.thoughtSignature.length > 0) {
+        thinkingSignature = part.thoughtSignature
+      }
+      continue
+    }
+
+    if (hasText) {
+      textAccum += part.text
+      continue
+    }
+
+    if (part.functionCall) {
+      toolCounter += 1
+      toolCalls.push({
+        id: `toolu_gemini_${toolCounter}`,
+        name: part.functionCall.name ?? '',
+        args: part.functionCall.args ?? {},
+      })
+    }
+  }
+
+  if (thinkingAccum.length > 0) {
+    content.push({ type: 'thinking', thinking: thinkingAccum, signature: thinkingSignature })
+  }
+  if (textAccum.length > 0) {
+    content.push({ type: 'text', text: textAccum })
+  }
+  for (const tool of toolCalls) {
+    if (!tool.name) {
+      throw new Error('[geminiCompat] non-streaming functionCall missing name')
+    }
+    content.push({
+      type: 'tool_use',
+      id: tool.id,
+      name: tool.name,
+      input: tool.args ?? {},
+    })
+  }
+
+  if (content.length === 0) {
+    content.push({ type: 'text', text: '' })
+  }
+
+  if (candidate?.finishReason && GEMINI_ERROR_FINISH_REASONS.has(candidate.finishReason)) {
+    throw new Error(`[geminiCompat] generation stopped: ${candidate.finishReason}`)
+  }
+
+  let stopReason: BetaMessage['stop_reason'] = mapGeminiFinishReason(candidate?.finishReason)
+  if (toolCalls.length > 0 && stopReason !== 'max_tokens') {
+    stopReason = 'tool_use'
+  }
+
+  return {
+    id: 'gemini-compat',
+    type: 'message',
+    role: 'assistant',
+    model: input.model,
+    content: content as unknown as BetaMessage['content'],
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: input.response.usageMetadata?.promptTokenCount ?? 0,
+      output_tokens: input.response.usageMetadata?.candidatesTokenCount ?? 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    },
+  } as BetaMessage
+}
