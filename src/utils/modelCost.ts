@@ -2,6 +2,8 @@ import type { BetaUsage as Usage } from '@anthropic-ai/sdk/resources/beta/messag
 import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from 'src/services/analytics/index.js'
 import { logEvent } from 'src/services/analytics/index.js'
 import { setHasUnknownModelCost } from '../bootstrap/state.js'
+import { getGlobalConfig } from './config.js'
+import { getGlobalCompatProvider } from './customApiStorage.js'
 import { isFastModeEnabled } from './fastMode.js'
 import {
   CLAUDE_3_5_HAIKU_CONFIG,
@@ -88,6 +90,27 @@ export const COST_HAIKU_45 = {
 
 const DEFAULT_UNKNOWN_MODEL_COST = COST_TIER_5_25
 
+// Zero-cost tier for unknown models on OpenAI/Gemini compat providers.
+// We have no pricing for arbitrary 3rd-party models (e.g. NIM Llama 3.1
+// 405B) and inheriting Opus pricing as the fallback would generate fake
+// $-amounts in /cost and StatusLine. Returning $0 paired with the existing
+// `hasUnknownModelCost` disclaimer keeps the user informed without
+// fabricating numbers.
+const COMPAT_UNKNOWN_MODEL_COST = {
+  inputTokens: 0,
+  outputTokens: 0,
+  promptCacheWriteTokens: 0,
+  promptCacheReadTokens: 0,
+  webSearchRequests: 0,
+} as const satisfies ModelCosts
+
+function isCompatProviderActive(): boolean {
+  const customConfig = getGlobalConfig().customApiEndpoint
+  const provider =
+    customConfig?.provider ?? getGlobalCompatProvider(customConfig?.baseURL)
+  return provider === 'openai' || provider === 'gemini'
+}
+
 /**
  * Get the cost tier for Opus 4.6 based on fast mode.
  */
@@ -155,6 +178,14 @@ export function getModelCosts(model: string, usage: Usage): ModelCosts {
   const costs = MODEL_COSTS[shortName]
   if (!costs) {
     trackUnknownModelCost(model, shortName)
+    // On a compat endpoint (NIM, Together, custom proxy, etc.) we don't
+    // have pricing for arbitrary models. Returning Opus pricing as fallback
+    // would mislead users into thinking their NIM session costs $$ when
+    // they're paying NIM, not Anthropic. Show $0 instead — paired with the
+    // hasUnknownModelCost disclaimer that's already surfaced in /cost.
+    if (isCompatProviderActive()) {
+      return COMPAT_UNKNOWN_MODEL_COST
+    }
     return (
       MODEL_COSTS[getCanonicalName(getDefaultMainLoopModelSetting())] ??
       DEFAULT_UNKNOWN_MODEL_COST
