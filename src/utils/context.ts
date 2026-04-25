@@ -74,12 +74,18 @@ export function getContextWindowForModel(
   const customConfig = getGlobalConfig().customApiEndpoint
   const compatContextWindow = customConfig?.contextWindow
   const compatProvider = customConfig?.provider ?? getGlobalCompatProvider(customConfig?.baseURL)
-  if (
-    (compatProvider === 'openai' || compatProvider === 'gemini') &&
-    typeof compatContextWindow === 'number' &&
-    compatContextWindow > 0
-  ) {
-    return compatContextWindow
+  if (compatProvider === 'openai' || compatProvider === 'gemini') {
+    if (typeof compatContextWindow === 'number' && compatContextWindow > 0) {
+      return compatContextWindow
+    }
+    // Env-var fallback for headless/CI sessions where /context-window can't run.
+    const envCompatWindow = process.env.CLAUDE_CODE_COMPAT_CONTEXT_WINDOW
+    if (envCompatWindow) {
+      const parsed = parseInt(envCompatWindow, 10)
+      if (!isNaN(parsed) && parsed > 0) {
+        return parsed
+      }
+    }
   }
 
   // [1m] suffix — explicit client-side opt-in, respected over all detection
