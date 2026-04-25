@@ -8,6 +8,7 @@ import type {
   BetaUsage,
 } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import { setHasEstimatedUsage } from '../../bootstrap/state.js'
+import { logForDebugging } from '../../utils/debug.js'
 
 type AnyBlock = Record<string, unknown>
 
@@ -161,6 +162,36 @@ function mapAnthropicUserBlocksToOpenAIContent(
   })
 }
 
+// One-shot per session: warn that cache_control directives are dropped on
+// the wire when targeting an OpenAI-compat provider. Most compat providers
+// (NIM included) do not implement Anthropic's prompt-caching protocol, so
+// silently dropping them leaves users wondering why their cache hints had
+// no effect. Single log per session avoids spamming on every request.
+let cacheControlDroppedLogged = false
+
+function maybeWarnCacheControlDropped(messages: BetaMessageParam[]): void {
+  if (cacheControlDroppedLogged) return
+  for (const message of messages) {
+    if (typeof message.content === 'string') continue
+    if (!Array.isArray(message.content)) continue
+    for (const block of message.content) {
+      if (
+        block &&
+        typeof block === 'object' &&
+        'cache_control' in block &&
+        (block as { cache_control?: unknown }).cache_control != null
+      ) {
+        cacheControlDroppedLogged = true
+        logForDebugging(
+          '[openaiCompat] Anthropic cache_control directives are being dropped — provider does not support prompt caching.',
+          { level: 'warn' },
+        )
+        return
+      }
+    }
+  }
+}
+
 function stripSchemaMetaKeys(schema: unknown): unknown {
   if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return schema
   const { $schema: _s, $id: _i, ...rest } = schema as Record<string, unknown>
@@ -201,6 +232,7 @@ export function convertAnthropicRequestToOpenAI(input: {
 }): OpenAIChatRequest {
   const configuredModel = process.env.ANTHROPIC_MODEL?.trim()
   const targetModel = configuredModel || input.model
+  maybeWarnCacheControlDropped(input.messages)
   const messages: OpenAIChatMessage[] = []
 
   if (input.system) {
