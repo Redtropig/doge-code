@@ -36,6 +36,7 @@ import {
 import {
   convertAnthropicRequestToOpenAI,
   createAnthropicStreamFromOpenAI,
+  estimatePromptTokensFromRequest,
   createBetaMessageFromOpenAIResponse,
   createOpenAICompatStream,
   requestOpenAICompatNonStream,
@@ -2034,6 +2035,7 @@ async function* queryModel(
           return createAnthropicStreamFromOpenAI({
             reader,
             model: params.model,
+            fallbackPromptTokens: estimatePromptTokensFromRequest(openAIRequest),
           }) as unknown as Stream<BetaRawMessageStreamEvent>
         }
 

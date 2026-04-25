@@ -63,6 +63,10 @@ type State = {
   totalLinesAdded: number
   totalLinesRemoved: number
   hasUnknownModelCost: boolean
+  // Set when a compat-provider stream completed without delivering a usage
+  // chunk and we fell back to a rough character-based prompt-token estimate.
+  // Surfaced in StatusLine JSON so user statusline commands can render a `~`.
+  hasEstimatedUsage: boolean
   cwd: string
   modelUsage: { [modelName: string]: ModelUsage }
   mainLoopModelOverride: ModelSetting | undefined
@@ -292,6 +296,7 @@ function getInitialState(): State {
     totalLinesAdded: 0,
     totalLinesRemoved: 0,
     hasUnknownModelCost: false,
+    hasEstimatedUsage: false,
     cwd: resolvedCwd,
     modelUsage: {},
     mainLoopModelOverride: undefined,
@@ -750,6 +755,14 @@ export function hasUnknownModelCost(): boolean {
   return STATE.hasUnknownModelCost
 }
 
+export function setHasEstimatedUsage(): void {
+  STATE.hasEstimatedUsage = true
+}
+
+export function hasEstimatedUsage(): boolean {
+  return STATE.hasEstimatedUsage
+}
+
 export function getLastMainRequestId(): string | undefined {
   return STATE.lastMainRequestId
 }
@@ -870,6 +883,7 @@ export function resetCostState(): void {
   STATE.totalLinesAdded = 0
   STATE.totalLinesRemoved = 0
   STATE.hasUnknownModelCost = false
+  STATE.hasEstimatedUsage = false
   STATE.modelUsage = {}
   STATE.promptId = null
 }

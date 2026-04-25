@@ -7,6 +7,7 @@ import type {
   BetaToolUnion,
   BetaUsage,
 } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
+import { setHasEstimatedUsage } from '../../bootstrap/state.js'
 
 type AnyBlock = Record<string, unknown>
 
@@ -428,9 +429,48 @@ export function mapFinishReason(reason: string | null | undefined): BetaMessage[
   return 'end_turn'
 }
 
+/**
+ * Estimate prompt tokens from an outgoing OpenAI request body. Used as a
+ * fallback when the upstream stream completes without delivering a usage
+ * chunk (some compat providers drop usage on early disconnects, others
+ * never emit it). Coarse char/4 estimate — better than reporting 0 input
+ * tokens, which would peg StatusLine context-% at 0 and break autocompact
+ * threshold checks.
+ */
+export function estimatePromptTokensFromRequest(
+  request: OpenAIChatRequest,
+): number {
+  let chars = 0
+  for (const message of request.messages) {
+    if (typeof message.content === 'string') {
+      chars += message.content.length
+    } else if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (part.type === 'text') chars += part.text.length
+        // image_url parts intentionally undercounted — we cannot estimate
+        // image-token cost here without decoding.
+      }
+    }
+    if (message.tool_call_id) chars += message.tool_call_id.length
+    if (message.tool_calls) {
+      for (const call of message.tool_calls) {
+        chars += call.function.name.length + call.function.arguments.length
+      }
+    }
+  }
+  // Tools schemas (request.tools) also burn tokens; they are typically
+  // dwarfed by message content for active conversations, so we skip them
+  // to keep the helper simple.
+  return Math.round(chars / 4)
+}
+
 export async function* createAnthropicStreamFromOpenAI(input: {
   reader: ReadableStreamDefaultReader<Uint8Array>
   model: string
+  // Pre-computed rough estimate used only if the upstream stream never
+  // delivers a usage block. Caller passes
+  // estimatePromptTokensFromRequest(request).
+  fallbackPromptTokens?: number
 }): AsyncGenerator<BetaRawMessageStreamEvent, BetaMessage, void> {
   const decoder = new TextDecoder()
   let buffer = ''
@@ -441,6 +481,7 @@ export async function* createAnthropicStreamFromOpenAI(input: {
   let promptTokens = 0
   let completionTokens = 0
   let cachedTokens = 0
+  let sawUsageBlock = false
   let emittedAnyContent = false
   let responseId = 'openai-compat'
   let stopReason: BetaMessage['stop_reason'] = 'end_turn'
@@ -486,6 +527,7 @@ export async function* createAnthropicStreamFromOpenAI(input: {
         }
 
         if (chunk.usage) {
+          sawUsageBlock = true
           promptTokens = chunk.usage.prompt_tokens ?? promptTokens
           completionTokens = chunk.usage.completion_tokens ?? completionTokens
           cachedTokens =
@@ -632,6 +674,16 @@ export async function* createAnthropicStreamFromOpenAI(input: {
       content_block: { type: 'text', text: '' },
     } as BetaRawMessageStreamEvent
     yield { type: 'content_block_stop', index: idx } as BetaRawMessageStreamEvent
+  }
+
+  // Fallback: some compat providers never emit a usage chunk (early
+  // disconnect recoveries, partial deployments). Without this, downstream
+  // sees input_tokens=0 forever — autocompact never fires, StatusLine
+  // shows 0%. Use the caller-provided rough estimate and flag the session
+  // so the StatusLine can mark the value as approximate.
+  if (!sawUsageBlock && promptTokens === 0 && (input.fallbackPromptTokens ?? 0) > 0) {
+    promptTokens = input.fallbackPromptTokens as number
+    setHasEstimatedUsage()
   }
 
   // OpenAI's prompt_tokens INCLUDES cached_tokens; Anthropic's input_tokens
