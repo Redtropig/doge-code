@@ -367,11 +367,24 @@ export async function autoCompactIfNeeded(
     // next query loop iteration can skip futile retry attempts.
     const prevFailures = tracking?.consecutiveFailures ?? 0
     const nextFailures = prevFailures + 1
-    if (nextFailures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES) {
+    // Surface a one-shot notification on the trip transition (prev<MAX, next>=MAX).
+    // Without this, NIM users with a wrong contextWindow setting silently
+    // lose autocompact for the rest of the session and have no clue why.
+    if (
+      prevFailures < MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES &&
+      nextFailures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
+    ) {
       logForDebugging(
         `autocompact: circuit breaker tripped after ${nextFailures} consecutive failures — skipping future attempts this session`,
         { level: 'warn' },
       )
+      toolUseContext.addNotification?.({
+        key: 'autocompact-circuit-breaker',
+        text: `Auto-compaction disabled after ${MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES} consecutive failures. Run /compact manually, or check /context-window if you're on a small-window compat endpoint.`,
+        priority: 'immediate',
+        color: 'warning',
+        timeoutMs: 12_000,
+      })
     }
     return { wasCompacted: false, consecutiveFailures: nextFailures }
   }
