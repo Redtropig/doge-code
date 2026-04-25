@@ -60,6 +60,19 @@ export type OpenAIChatRequest = {
   max_tokens?: number
 }
 
+type OpenAIUsage = {
+  prompt_tokens?: number
+  completion_tokens?: number
+  total_tokens?: number
+  // OpenAI prompt-caching shape (also used by some compat providers).
+  // Cached tokens are billed at a discount and, importantly, are INCLUDED
+  // in prompt_tokens — the Anthropic shape splits them into a separate
+  // cache_read_input_tokens field, so converters must subtract on the way out.
+  prompt_tokens_details?: {
+    cached_tokens?: number
+  }
+}
+
 type OpenAIStreamChunk = {
   id?: string
   model?: string
@@ -81,11 +94,7 @@ type OpenAIStreamChunk = {
     }
     finish_reason?: string | null
   }>
-  usage?: {
-    prompt_tokens?: number
-    completion_tokens?: number
-    total_tokens?: number
-  }
+  usage?: OpenAIUsage
 }
 
 export function joinBaseUrl(baseURL: string, path: string): string {
@@ -431,6 +440,7 @@ export async function* createAnthropicStreamFromOpenAI(input: {
   let nextContentIndex = 0
   let promptTokens = 0
   let completionTokens = 0
+  let cachedTokens = 0
   let emittedAnyContent = false
   let responseId = 'openai-compat'
   let stopReason: BetaMessage['stop_reason'] = 'end_turn'
@@ -478,6 +488,8 @@ export async function* createAnthropicStreamFromOpenAI(input: {
         if (chunk.usage) {
           promptTokens = chunk.usage.prompt_tokens ?? promptTokens
           completionTokens = chunk.usage.completion_tokens ?? completionTokens
+          cachedTokens =
+            chunk.usage.prompt_tokens_details?.cached_tokens ?? cachedTokens
         }
         if (chunk.id) responseId = chunk.id
 
@@ -622,13 +634,19 @@ export async function* createAnthropicStreamFromOpenAI(input: {
     yield { type: 'content_block_stop', index: idx } as BetaRawMessageStreamEvent
   }
 
+  // OpenAI's prompt_tokens INCLUDES cached_tokens; Anthropic's input_tokens
+  // EXCLUDES the cache-read portion. Subtract so totals don't double-count
+  // when downstream code adds them together. Clamped at 0 in case a buggy
+  // provider reports cached > prompt.
+  const fresh_input_tokens = Math.max(0, promptTokens - cachedTokens)
+
   yield {
     type: 'message_delta',
     delta: { stop_reason: stopReason, stop_sequence: null },
     usage: {
-      input_tokens: promptTokens,
+      input_tokens: fresh_input_tokens,
       cache_creation_input_tokens: 0,
-      cache_read_input_tokens: 0,
+      cache_read_input_tokens: cachedTokens,
       output_tokens: completionTokens,
     },
   } as BetaRawMessageStreamEvent
@@ -644,22 +662,25 @@ export async function* createAnthropicStreamFromOpenAI(input: {
     stop_reason: stopReason,
     stop_sequence: null,
     usage: {
-      input_tokens: promptTokens,
+      input_tokens: fresh_input_tokens,
       output_tokens: completionTokens,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: cachedTokens,
     },
   } as BetaMessage
 }
 
-export function mapOpenAIUsageToAnthropic(usage?: {
-  prompt_tokens?: number
-  completion_tokens?: number
-}): BetaUsage | undefined {
+export function mapOpenAIUsageToAnthropic(
+  usage?: OpenAIUsage,
+): BetaUsage | undefined {
   if (!usage) return undefined
+  const cached = usage.prompt_tokens_details?.cached_tokens ?? 0
+  const prompt = usage.prompt_tokens ?? 0
   return {
-    input_tokens: usage.prompt_tokens ?? 0,
+    input_tokens: Math.max(0, prompt - cached),
     output_tokens: usage.completion_tokens ?? 0,
     cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 0,
+    cache_read_input_tokens: cached,
   } as BetaUsage
 }
 
@@ -676,11 +697,7 @@ type OpenAIChatCompletionResponse = {
     }
     finish_reason?: string | null
   }>
-  usage?: {
-    prompt_tokens?: number
-    completion_tokens?: number
-    total_tokens?: number
-  }
+  usage?: OpenAIUsage
   error?: { message?: string; code?: string | number; type?: string }
 }
 
@@ -792,6 +809,10 @@ export function createBetaMessageFromOpenAIResponse(input: {
     stopReason = 'tool_use'
   }
 
+  const cachedTokens =
+    input.response.usage?.prompt_tokens_details?.cached_tokens ?? 0
+  const promptTokens = input.response.usage?.prompt_tokens ?? 0
+
   return {
     id: input.response.id ?? 'openai-compat',
     type: 'message',
@@ -801,10 +822,10 @@ export function createBetaMessageFromOpenAIResponse(input: {
     stop_reason: stopReason,
     stop_sequence: null,
     usage: {
-      input_tokens: input.response.usage?.prompt_tokens ?? 0,
+      input_tokens: Math.max(0, promptTokens - cachedTokens),
       output_tokens: input.response.usage?.completion_tokens ?? 0,
       cache_creation_input_tokens: 0,
-      cache_read_input_tokens: 0,
+      cache_read_input_tokens: cachedTokens,
     },
   } as BetaMessage
 }
