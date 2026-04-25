@@ -81,7 +81,10 @@ type OpenAIStreamChunk = {
   choices?: Array<{
     index?: number
     delta?: {
-      role?: 'assistant'
+      // Spec says assistant; widened to string so a misbehaving provider
+      // sending role:'system' / role:'user' is captured at runtime by the
+      // guard below (instead of static type narrowing hiding it).
+      role?: string
       content?: string | null
       reasoning_content?: string | null
       tool_calls?: Array<{
@@ -590,6 +593,18 @@ export async function* createAnthropicStreamFromOpenAI(input: {
         const choice = chunk.choices?.[0]
         if (!choice) continue
         const delta = choice.delta
+
+        // Some compat providers occasionally emit chunks with role!='assistant'
+        // (e.g. role:'system' tagged warnings). The Anthropic stream protocol
+        // assumes assistant-only deltas; treating these as content silently
+        // corrupts conversation history. Skip the chunk entirely.
+        if (delta?.role && delta.role !== 'assistant') {
+          logForDebugging(
+            `[openaiCompat] unexpected delta.role=${delta.role}, skipping chunk`,
+            { level: 'warn' },
+          )
+          continue
+        }
 
         if (delta?.reasoning_content) {
           if (currentTextIndex !== null) {
