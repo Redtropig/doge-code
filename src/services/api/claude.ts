@@ -961,6 +961,7 @@ export async function* executeNonStreamingRequest(
             return createBetaMessageFromOpenAIResponse({
               response: openAIResponse,
               model: adjustedParams.model,
+              fallbackPromptTokens: estimatePromptTokensFromRequest(openAIRequest),
             })
           } finally {
             clearTimeout(timeoutId)

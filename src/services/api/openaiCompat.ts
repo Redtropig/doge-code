@@ -868,6 +868,11 @@ export async function requestOpenAICompatNonStream(
 export function createBetaMessageFromOpenAIResponse(input: {
   response: OpenAIChatCompletionResponse
   model: string
+  // Non-streaming counterpart of stream's fallbackPromptTokens. Most
+  // OpenAI-compat responses include usage, but the streaming-to-non-streaming
+  // fallback path (used after 502 recoveries) inherits whatever the
+  // provider returns — and a buggy provider might omit usage there too.
+  fallbackPromptTokens?: number
 }): BetaMessage {
   const choice = input.response.choices?.[0]
   const message = choice?.message
@@ -921,7 +926,16 @@ export function createBetaMessageFromOpenAIResponse(input: {
 
   const cachedTokens =
     input.response.usage?.prompt_tokens_details?.cached_tokens ?? 0
-  const promptTokens = input.response.usage?.prompt_tokens ?? 0
+  let promptTokens = input.response.usage?.prompt_tokens ?? 0
+
+  if (
+    !input.response.usage &&
+    promptTokens === 0 &&
+    (input.fallbackPromptTokens ?? 0) > 0
+  ) {
+    promptTokens = input.fallbackPromptTokens as number
+    setHasEstimatedUsage()
+  }
 
   return {
     id: input.response.id ?? 'openai-compat',
