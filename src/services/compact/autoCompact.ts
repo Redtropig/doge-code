@@ -29,12 +29,28 @@ import { trySessionMemoryCompaction } from './sessionMemoryCompact.js'
 // Based on p99.99 of compact summary output being 17,387 tokens.
 const MAX_OUTPUT_TOKENS_FOR_SUMMARY = 20_000
 
-// Returns the context window size minus the max output tokens for the model
-export function getEffectiveContextWindowSize(model: string): number {
-  const reservedTokensForSummary = Math.min(
-    getMaxOutputTokensForModel(model),
-    MAX_OUTPUT_TOKENS_FOR_SUMMARY,
+// Reference window the constants above are sized for. For windows smaller
+// than this (e.g. NIM Llama 3.1 at 32k), the reserved-summary and autocompact
+// buffer constants would consume the entire window, leaving a negative
+// threshold. scaleForWindow() shrinks them proportionally for small windows
+// while keeping behavior at >=200k unchanged.
+const REFERENCE_CONTEXT_WINDOW = 200_000
+
+function scaleForWindow(
+  baseValue: number,
+  contextWindow: number,
+  minValue = 1_000,
+): number {
+  if (contextWindow >= REFERENCE_CONTEXT_WINDOW) return baseValue
+  return Math.max(
+    minValue,
+    Math.floor((contextWindow / REFERENCE_CONTEXT_WINDOW) * baseValue),
   )
+}
+
+// Resolve the effective context window honoring the
+// CLAUDE_CODE_AUTO_COMPACT_WINDOW cap.
+function resolveAutoCompactContextWindow(model: string): number {
   let contextWindow = getContextWindowForModel(model, getSdkBetas())
 
   const autoCompactWindow = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
@@ -44,7 +60,17 @@ export function getEffectiveContextWindowSize(model: string): number {
       contextWindow = Math.min(contextWindow, parsed)
     }
   }
+  return contextWindow
+}
 
+// Returns the context window size minus the (scaled) max output tokens for
+// the model.
+export function getEffectiveContextWindowSize(model: string): number {
+  const contextWindow = resolveAutoCompactContextWindow(model)
+  const reservedTokensForSummary = Math.min(
+    getMaxOutputTokensForModel(model),
+    scaleForWindow(MAX_OUTPUT_TOKENS_FOR_SUMMARY, contextWindow),
+  )
   return contextWindow - reservedTokensForSummary
 }
 
@@ -71,9 +97,10 @@ const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
 
 export function getAutoCompactThreshold(model: string): number {
   const effectiveContextWindow = getEffectiveContextWindowSize(model)
+  const contextWindow = resolveAutoCompactContextWindow(model)
+  const scaledBuffer = scaleForWindow(AUTOCOMPACT_BUFFER_TOKENS, contextWindow)
 
-  const autocompactThreshold =
-    effectiveContextWindow - AUTOCOMPACT_BUFFER_TOKENS
+  const autocompactThreshold = effectiveContextWindow - scaledBuffer
 
   // Override for easier testing of autocompact
   const envPercent = process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
