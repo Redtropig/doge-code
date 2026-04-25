@@ -652,6 +652,17 @@ export async function* createAnthropicStreamFromOpenAI(input: {
           const openAIIndex = toolCall.index ?? 0
           let state = toolCallState.get(openAIIndex)
           if (!state) {
+            // If toolCall.id arrives in a later chunk, line below overwrites
+            // this fallback. If it never arrives, we send the fabricated id
+            // back when constructing tool_result — which the provider may
+            // 400 because it doesn't recognize it. Log once per session so
+            // we can see whether NIM (or others) actually triggers this.
+            if (!toolCall.id) {
+              logForDebugging(
+                `[openaiCompat] tool_call at index=${openAIIndex} arrived without id; using fabricated toolu_openai_${openAIIndex}. If you see provider 400s on tool_result, this is likely the cause.`,
+                { level: 'warn' },
+              )
+            }
             state = {
               id: toolCall.id ?? `toolu_openai_${openAIIndex}`,
               name: toolCall.function?.name ?? '',
