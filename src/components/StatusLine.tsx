@@ -4,7 +4,7 @@ import { memo, useCallback, useEffect, useRef } from 'react';
 import { logEvent } from 'src/services/analytics/index.js';
 import { useAppState, useSetAppState } from 'src/state/AppState.js';
 import type { PermissionMode } from 'src/utils/permissions/PermissionMode.js';
-import { getIsRemoteMode, getKairosActive, getMainThreadAgentType, getOriginalCwd, getSdkBetas, getSessionId } from '../bootstrap/state.js';
+import { getIsRemoteMode, getKairosActive, getMainThreadAgentType, getOriginalCwd, getSdkBetas, getSessionId, hasEstimatedUsage, hasUnknownModelCost } from '../bootstrap/state.js';
 import { DEFAULT_OUTPUT_STYLE_NAME } from '../constants/outputStyles.js';
 import { useNotifications } from '../context/notifications.js';
 import { getTotalAPIDuration, getTotalCost, getTotalDuration, getTotalInputTokens, getTotalLinesAdded, getTotalLinesRemoved, getTotalOutputTokens } from '../cost-tracker.js';
@@ -85,7 +85,14 @@ function buildStatusLineCommandInput(permissionMode: PermissionMode, exceeds200k
       total_duration_ms: getTotalDuration(),
       total_api_duration_ms: getTotalAPIDuration(),
       total_lines_added: getTotalLinesAdded(),
-      total_lines_removed: getTotalLinesRemoved()
+      total_lines_removed: getTotalLinesRemoved(),
+      // Set when at least one assistant message used a model whose pricing
+      // we don't know (typically compat-provider models like NIM Llama).
+      // Existing behavior: total_cost_usd shows whatever fallback pricing
+      // produced. After T3.1 unknown-compat sessions return $0 instead.
+      // Statusline commands can read this flag to render "?" rather than
+      // a misleading number.
+      unknown_model_cost: hasUnknownModelCost()
     },
     context_window: {
       total_input_tokens: getTotalInputTokens(),
@@ -93,7 +100,11 @@ function buildStatusLineCommandInput(permissionMode: PermissionMode, exceeds200k
       context_window_size: contextWindowSize,
       current_usage: currentUsage,
       used_percentage: contextPercentages.used,
-      remaining_percentage: contextPercentages.remaining
+      remaining_percentage: contextPercentages.remaining,
+      // True when at least one usage figure in this session came from a
+      // char/4 estimate (compat stream completed without a usage chunk).
+      // Statusline commands may render percentages with a "~" prefix.
+      estimated: hasEstimatedUsage()
     },
     exceeds_200k_tokens: exceeds200kTokens,
     ...((rateLimits.five_hour || rateLimits.seven_day) && {
