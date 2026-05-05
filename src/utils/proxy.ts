@@ -10,7 +10,7 @@ import memoize from 'lodash-es/memoize.js'
 import type * as undici from 'undici'
 import { getCACertificates } from './caCerts.js'
 import { logForDebugging } from './debug.js'
-import { isEnvTruthy } from './envUtils.js'
+import { isEnvDefinedFalsy, isEnvTruthy } from './envUtils.js'
 import {
   getMTLSAgent,
   getMTLSConfig,
@@ -60,12 +60,22 @@ type EnvLike = Record<string, string | undefined>
 let cachedSystemProxyUrl: string | undefined | null = null
 
 function getSystemProxyUrl(): string | undefined {
-  if (!isEnvTruthy(process.env.DOGE_DETECT_SYSTEM_PROXY)) return undefined
+  // 默认开启系统代理探测；显式设为 falsy（0/false/no/off）才 opt-out
+  if (isEnvDefinedFalsy(process.env.DOGE_DETECT_SYSTEM_PROXY)) return undefined
   if (cachedSystemProxyUrl !== null) return cachedSystemProxyUrl ?? undefined
-  if (process.platform !== 'darwin') {
-    cachedSystemProxyUrl = undefined
-    return undefined
+
+  let detected: string | undefined
+  if (process.platform === 'darwin') {
+    detected = probeMacosSystemProxy()
+  } else if (process.platform === 'win32') {
+    detected = probeWindowsSystemProxy()
   }
+  // linux / wsl / unknown: keep undefined
+  cachedSystemProxyUrl = detected
+  return detected
+}
+
+function probeMacosSystemProxy(): string | undefined {
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { execFileSync } = require('child_process') as typeof import('child_process')
@@ -83,22 +93,91 @@ function getSystemProxyUrl(): string | undefined {
     const detected =
       pick('HTTPSEnable', 'HTTPSProxy', 'HTTPSPort') ??
       pick('HTTPEnable', 'HTTPProxy', 'HTTPPort')
-    cachedSystemProxyUrl = detected
     if (detected) {
       logForDebugging(`Detected macOS system proxy via scutil: ${detected}`)
     }
     return detected
   } catch (error) {
     logForDebugging(`scutil --proxy failed: ${String(error)}`)
-    cachedSystemProxyUrl = undefined
     return undefined
   }
+}
+
+function probeWindowsSystemProxy(): string | undefined {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { execFileSync } = require('child_process') as typeof import('child_process')
+    // reg.exe query 仅接受单个 /v ValueName 或 /ve；一次性查询整个 key，
+    // 用 m 标志正则在输出里挑出 ProxyEnable / ProxyServer。
+    const output = execFileSync(
+      'reg.exe',
+      [
+        'query',
+        'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings',
+      ],
+      { encoding: 'utf8', timeout: 2000, windowsHide: true },
+    )
+
+    const enableMatch = output.match(
+      /^\s*ProxyEnable\s+REG_DWORD\s+0x([0-9a-fA-F]+)/m,
+    )
+    if (!enableMatch || parseInt(enableMatch[1]!, 16) === 0) return undefined
+
+    const serverMatch = output.match(/^\s*ProxyServer\s+REG_SZ\s+(.+?)\s*$/m)
+    const raw = serverMatch?.[1]?.trim()
+    if (!raw) return undefined
+
+    const hostPort = parseProxyServer(raw)
+    if (!hostPort) return undefined
+
+    const detected = `http://${hostPort}`
+    logForDebugging(`Detected Windows system proxy via reg.exe: ${detected}`)
+    return detected
+  } catch (error) {
+    logForDebugging(`reg.exe query failed: ${String(error)}`)
+    return undefined
+  }
+}
+
+function parseProxyServer(raw: string): string | undefined {
+  const cleaned = raw.replace(/[;\s]+$/, '')
+  if (!cleaned) return undefined
+
+  let candidate: string | undefined
+  if (cleaned.includes('=')) {
+    // 形态 B: scheme=host:port; 列表，优先 https，回退 http
+    const map = new Map<string, string>()
+    for (const part of cleaned.split(';')) {
+      const eq = part.indexOf('=')
+      if (eq <= 0) continue
+      const scheme = part.slice(0, eq).trim().toLowerCase()
+      const value = part.slice(eq + 1).trim()
+      if (scheme && value) map.set(scheme, value)
+    }
+    candidate = map.get('https') ?? map.get('http')
+  } else {
+    candidate = cleaned
+  }
+
+  if (!candidate) return undefined
+  candidate = candidate.replace(/^https?:\/\//i, '')
+
+  // IPv6 用 [..]:port；IPv4 / 主机名禁含 ':' 避免回溯歧义
+  if (!/^(\[[0-9a-fA-F:]+\]|[^\s:\[\]]+):\d{1,5}$/.test(candidate)) {
+    logForDebugging(`Ignoring malformed ProxyServer value: ${raw}`)
+    return undefined
+  }
+  return candidate
 }
 
 /**
  * Get the active proxy URL if one is configured
  * Prefers lowercase variants over uppercase (https_proxy > HTTPS_PROXY > http_proxy > HTTP_PROXY)
- * Falls back to the OS-level proxy (macOS scutil) when DOGE_DETECT_SYSTEM_PROXY is set.
+ * Falls back to the OS-level system proxy by default on macOS / Windows
+ * (macOS: scutil --proxy; Windows: reg.exe query of HKCU Internet Settings).
+ * Set DOGE_DETECT_SYSTEM_PROXY=0 (or false/no/off) to opt out of OS-level detection.
+ * PAC URLs (AutoConfigURL) are not parsed — set HTTPS_PROXY manually for PAC-only setups.
+ * Linux / WSL: not implemented.
  * @param env Environment variables to check (defaults to process.env for production use)
  */
 export function getProxyUrl(env: EnvLike = process.env): string | undefined {
